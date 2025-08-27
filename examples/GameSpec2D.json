@@ -1,0 +1,58 @@
+{
+  "game": {
+    "title": "Forest Platformer"
+  },
+  "scenes": [
+    {
+      "name": "Level1",
+      "background": "forest_bg.png",
+      "tilemap": "grass_tileset.png",
+      "player": {
+        "sprite": "hero_idle.png",
+        "controller": "PlayerController.cs",
+        "spawn": [0, 0]
+      },
+      "enemies": [
+        {
+          "sprite": "slime.png",
+          "controller": "SlimeAI.cs",
+          "spawn": [5, 0]
+        },
+        {
+          "sprite": "bat.png",
+          "controller": "BatAI.cs",
+          "spawn": [8, 3]
+        }
+      ],
+      "collectibles": [
+        {
+          "sprite": "coin.png",
+          "spawn": [2, 1]
+        },
+        {
+          "sprite": "coin.png",
+          "spawn": [7, 2]
+        },
+        {
+          "sprite": "heart.png",
+          "spawn": [10, 4]
+        }
+      ],
+      "ui": [
+        {
+          "type": "label",
+          "text": "Score: 0",
+          "anchor": "top_left"
+        },
+        {
+          "type": "button",
+          "text": "Restart",
+          "anchor": "bottom_right",
+          "onClick": "RestartGame"
+        }
+      ]
+    }
+  ]
+}
+
+

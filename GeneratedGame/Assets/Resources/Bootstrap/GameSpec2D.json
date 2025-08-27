@@ -1,0 +1,52 @@
+{
+  "game": {
+    "title": "Game of Life 2D"
+  },
+  "scenes": [
+    {
+      "background": "background_desert.png",
+      "collectibles": [
+        {
+          "spawn": [
+            7,
+            8
+          ],
+          "sprite": "collectible_seed.png"
+        }
+      ],
+      "enemies": [
+        {
+          "controller": "BugController.cs",
+          "spawn": [
+            10,
+            3
+          ],
+          "sprite": "enemy_bug.png"
+        }
+      ],
+      "name": "MainLevel",
+      "player": {
+        "controller": "PlayerController.cs",
+        "spawn": [
+          5,
+          5
+        ],
+        "sprite": "player_avatar.png"
+      },
+      "tilemap": "desert_tilemap.json",
+      "ui": [
+        {
+          "anchor": "TopLeft",
+          "text": "Score: 0",
+          "type": "label"
+        },
+        {
+          "anchor": "TopRight",
+          "onClick": "GameManager.PauseGame",
+          "text": "Pause",
+          "type": "button"
+        }
+      ]
+    }
+  ]
+}

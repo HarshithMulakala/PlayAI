@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "GameSpec2D",
+  "type": "object",
+  "required": ["game", "scenes"],
+  "properties": {
+    "game": {
+      "type": "object",
+      "required": ["title"],
+      "properties": {
+        "title": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "background": { "type": "string" },
+          "tilemap": { "type": "string" },
+          "player": {
+            "$ref": "#/definitions/actor"
+          },
+          "enemies": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/actor" }
+          },
+          "collectibles": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/collectible" }
+          },
+          "ui": {
+            "type": "array",
+            "items": { "$ref": "#/definitions/uiElement" }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "definitions": {
+    "actor": {
+      "type": "object",
+      "required": ["sprite", "spawn"],
+      "properties": {
+        "sprite": { "type": "string" },
+        "controller": { "type": "string" },
+        "spawn": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "number" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "collectible": {
+      "type": "object",
+      "required": ["sprite", "spawn"],
+      "properties": {
+        "sprite": { "type": "string" },
+        "spawn": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "number" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "uiElement": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "enum": ["label", "button", "score"] },
+        "text": { "type": "string" },
+        "anchor": { "type": "string", "enum": ["top_left", "top_right", "bottom_left", "bottom_right", "center"] },
+        "onClick": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+
+
