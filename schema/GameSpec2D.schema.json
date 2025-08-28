@@ -90,6 +90,8 @@
         "type": { "type": "string", "enum": ["Box", "Circle", "Polygon"] },
         "size": { "$ref": "#/$defs/vector2" },
         "radius": { "type": "number" },
+        "offset": { "$ref": "#/$defs/vector2" },
+        "autoSize": { "type": "boolean" },
         "isTrigger": { "type": "boolean" },
         "material": { "type": ["string", "null"] }
       },
@@ -135,7 +137,8 @@
         "anchorMin": { "$ref": "#/$defs/vector2" },
         "anchorMax": { "$ref": "#/$defs/vector2" },
         "pivot": { "$ref": "#/$defs/vector2" },
-        "position": { "$ref": "#/$defs/vector2" }
+        "position": { "$ref": "#/$defs/vector2" },
+        "sizeDelta": { "$ref": "#/$defs/vector2" }
       },
       "required": ["anchorMin", "anchorMax", "pivot", "position"]
     },

@@ -27,6 +27,7 @@ public static class SpecBootstrapper
         private const string PendingSpecKey = "PlayAI.PendingSpecPath";
         private const string PendingScriptsKey = "PlayAI.PendingScriptsPath";
         private static HashSet<string> s_ProcessedSpriteAssets = new HashSet<string>();
+        private static Dictionary<string, Type> s_ScriptTypeCache = new Dictionary<string, Type>(StringComparer.Ordinal);
 
         [MenuItem("Tools/AI/Import From Spec...")]
         private static void ImportFromSpecMenu()
@@ -71,7 +72,24 @@ public static class SpecBootstrapper
             try
             {
                 s_ProcessedSpriteAssets.Clear();
+                BuildScriptTypeCache();
                 string json = File.ReadAllText(specPath);
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    Debug.LogError("SpecBootstrapper: Spec file is empty.");
+                    return;
+                }
+                if (json.Length > 10_000_000)
+                {
+                    Debug.LogError($"SpecBootstrapper: Spec file is unexpectedly large ({json.Length} chars). Aborting to avoid memory issues. Ensure you selected the generated spec JSON, not a project file.");
+                    return;
+                }
+                var trimmed = json.TrimStart();
+                if (trimmed.Length == 0 || trimmed[0] != '{')
+                {
+                    Debug.LogError("SpecBootstrapper: Spec does not look like a JSON object. Ensure you selected the correct spec file.");
+                    return;
+                }
                 var root = MiniJSON.Deserialize(json) as Dictionary<string, object>;
                 if (root == null)
                 {
@@ -101,6 +119,40 @@ public static class SpecBootstrapper
                 EditorPrefs.DeleteKey(PendingScriptsKey);
                 EditorUtility.ClearProgressBar();
                 s_ProcessedSpriteAssets.Clear();
+            }
+        }
+
+        private static void BuildScriptTypeCache()
+        {
+            s_ScriptTypeCache.Clear();
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            foreach (var asm in assemblies)
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch { continue; }
+                foreach (var t in types)
+                {
+                    if (t == null) continue;
+                    if (!typeof(MonoBehaviour).IsAssignableFrom(t)) continue;
+                    // Cache by full name and simple name (last one wins; prefer Assembly-CSharp later)
+                    if (!string.IsNullOrEmpty(t.FullName)) s_ScriptTypeCache[t.FullName] = t;
+                    if (!string.IsNullOrEmpty(t.Name)) s_ScriptTypeCache[t.Name] = t;
+                }
+            }
+            // Prefer Assembly-CSharp variants by overwriting
+            foreach (var asm in assemblies.Where(a => string.Equals(a.GetName().Name, "Assembly-CSharp", StringComparison.Ordinal)))
+            {
+                Type[] types;
+                try { types = asm.GetTypes(); }
+                catch { continue; }
+                foreach (var t in types)
+                {
+                    if (t == null) continue;
+                    if (!typeof(MonoBehaviour).IsAssignableFrom(t)) continue;
+                    if (!string.IsNullOrEmpty(t.FullName)) s_ScriptTypeCache[t.FullName] = t;
+                    if (!string.IsNullOrEmpty(t.Name)) s_ScriptTypeCache[t.Name] = t;
+                }
             }
         }
 
@@ -186,6 +238,9 @@ public static class SpecBootstrapper
                     }
                 }
 
+                // Post placement: align dynamic objects tagged Player/Enemy/Coin on top of nearest ground
+                TryAlignObjectsToGround();
+
                 // UI elements
                 var ui = GetList<object>(sceneDict, "ui");
                 if (ui != null)
@@ -246,9 +301,14 @@ public static class SpecBootstrapper
                 var renderModeStr = GetString(uiSettings, "renderMode");
                 if (!string.IsNullOrEmpty(renderModeStr))
                 {
-                    if (Enum.TryParse<RenderMode>(renderModeStr.Replace("ScreenSpace", "ScreenSpace"), out var rm))
+                    if (Enum.TryParse<RenderMode>(renderModeStr, out var rm))
                     {
                         canvas.renderMode = rm;
+                        if (rm == RenderMode.ScreenSpaceCamera)
+                        {
+                            var mainCam = Camera.main ?? UnityEngine.Object.FindFirstObjectByType<Camera>();
+                            if (mainCam != null) canvas.worldCamera = mainCam;
+                        }
                     }
                 }
                 var refRes = GetDict(uiSettings, "referenceResolution");
@@ -354,11 +414,18 @@ public static class SpecBootstrapper
                 if (colDict != null)
                 {
                     string type = GetString(colDict, "type");
+                    bool autoSize = GetBool(colDict, "autoSize", true);
+                    var offsetDict = GetDict(colDict, "offset");
+                    Vector2? desiredOffset = null;
+                    if (offsetDict != null)
+                    {
+                        desiredOffset = new Vector2(GetFloat(offsetDict, "x", 0f), GetFloat(offsetDict, "y", 0f));
+                    }
                     if (type == "Box")
                     {
                         var box = go.AddComponent<BoxCollider2D>();
                         var size = GetDict(colDict, "size");
-                        if (size != null)
+                        if (!autoSize && size != null)
                         {
                             box.size = new Vector2(GetFloat(size, "x", 1f), GetFloat(size, "y", 1f));
                         }
@@ -373,12 +440,13 @@ public static class SpecBootstrapper
                             }
                         }
                         box.isTrigger = GetBool(colDict, "isTrigger", box.isTrigger);
+                        if (desiredOffset.HasValue) box.offset = desiredOffset.Value;
                     }
                     else if (type == "Circle")
                     {
                         var circle = go.AddComponent<CircleCollider2D>();
                         float? r = TryGetFloat(colDict, "radius");
-                        if (r.HasValue)
+                        if (!autoSize && r.HasValue)
                         {
                             circle.radius = r.Value;
                         }
@@ -393,10 +461,12 @@ public static class SpecBootstrapper
                             }
                         }
                         circle.isTrigger = GetBool(colDict, "isTrigger", circle.isTrigger);
+                        if (desiredOffset.HasValue) circle.offset = desiredOffset.Value;
                     }
                     else if (type == "Polygon")
                     {
-                        go.AddComponent<PolygonCollider2D>();
+                        var poly = go.AddComponent<PolygonCollider2D>();
+                        if (desiredOffset.HasValue) poly.offset = desiredOffset.Value;
                     }
                 }
             }
@@ -442,10 +512,21 @@ public static class SpecBootstrapper
                 var anchorMax = GetDict(rt, "anchorMax");
                 var pivot = GetDict(rt, "pivot");
                 var position = GetDict(rt, "position");
-                if (anchorMin != null) rect.anchorMin = new Vector2(GetFloat(anchorMin, "x", 0f), GetFloat(anchorMin, "y", 0f));
-                if (anchorMax != null) rect.anchorMax = new Vector2(GetFloat(anchorMax, "x", 1f), GetFloat(anchorMax, "y", 1f));
+                var sizeDelta = GetDict(rt, "sizeDelta");
+                if (anchorMin != null) rect.anchorMin = new Vector2(GetFloat(anchorMin, "x", 0.5f), GetFloat(anchorMin, "y", 0.5f));
+                if (anchorMax != null) rect.anchorMax = new Vector2(GetFloat(anchorMax, "x", 0.5f), GetFloat(anchorMax, "y", 0.5f));
                 if (pivot != null) rect.pivot = new Vector2(GetFloat(pivot, "x", 0.5f), GetFloat(pivot, "y", 0.5f));
                 if (position != null) rect.anchoredPosition = new Vector2(GetFloat(position, "x", 0f), GetFloat(position, "y", 0f));
+                if (sizeDelta != null) rect.sizeDelta = new Vector2(GetFloat(sizeDelta, "x", 160f), GetFloat(sizeDelta, "y", 40f));
+            }
+            else
+            {
+                // Centered defaults so UI is visible
+                rect.anchorMin = new Vector2(0.5f, 0.5f);
+                rect.anchorMax = new Vector2(0.5f, 0.5f);
+                rect.pivot = new Vector2(0.5f, 0.5f);
+                rect.anchoredPosition = Vector2.zero;
+                rect.sizeDelta = new Vector2(300f, 80f);
             }
 
             if (type == "text")
@@ -468,6 +549,7 @@ public static class SpecBootstrapper
                     string assetPath = EnsureSpriteAssetAvailable(relPath, null);
                     var sprite = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
                     img.sprite = sprite;
+                    if (sprite != null) img.SetNativeSize();
                 }
                 AttachUIScripts(go, ui);
             }
@@ -481,8 +563,60 @@ public static class SpecBootstrapper
                     string assetPath = EnsureSpriteAssetAvailable(relPath, null);
                     var sprite = AssetDatabase.LoadAssetAtPath<Sprite>(assetPath);
                     img.sprite = sprite;
+                    if (sprite != null) img.SetNativeSize();
                 }
                 AttachUIScripts(go, ui);
+            }
+        }
+
+        private static void TryAlignObjectsToGround()
+        {
+            var all = UnityEngine.Object.FindObjectsOfType<GameObject>();
+            var groundColliders = new List<Collider2D>();
+            int groundLayer = LayerMask.NameToLayer("Ground");
+            foreach (var g in all)
+            {
+                if (g == null) continue;
+                if (g.CompareTag("Ground") || (groundLayer >= 0 && g.layer == groundLayer))
+                {
+                    var cols = g.GetComponentsInChildren<Collider2D>();
+                    if (cols != null && cols.Length > 0) groundColliders.AddRange(cols);
+                }
+            }
+
+            if (groundColliders.Count == 0) return;
+
+            foreach (var g in all)
+            {
+                if (g == null) continue;
+                if (g.CompareTag("Ground")) continue;
+                var rb = g.GetComponent<Rigidbody2D>();
+                if (rb == null || rb.bodyType != RigidbodyType2D.Dynamic) continue;
+                var sr = g.GetComponent<SpriteRenderer>();
+                if (sr == null || sr.sprite == null) continue;
+
+                Bounds b = sr.bounds;
+                float centerX = b.center.x;
+                float bottomY = b.min.y;
+
+                float bestTop = float.NegativeInfinity;
+                foreach (var col in groundColliders)
+                {
+                    if (col == null) continue;
+                    var gb = col.bounds;
+                    if (centerX < gb.min.x || centerX > gb.max.x) continue;
+                    if (gb.max.y > bestTop) bestTop = gb.max.y;
+                }
+
+                if (bestTop > float.NegativeInfinity)
+                {
+                    float dy = bestTop - bottomY;
+                    if (Mathf.Abs(dy) > 0.001f)
+                    {
+                        var p = g.transform.position;
+                        g.transform.position = new Vector3(p.x, p.y + dy, p.z);
+                    }
+                }
             }
         }
 
@@ -502,17 +636,29 @@ public static class SpecBootstrapper
 
         private static void AttachScriptByName(GameObject go, string scriptName, Dictionary<string, object> parameters)
         {
-            // Try to resolve type by name across loaded assemblies
-            var type = AppDomain.CurrentDomain.GetAssemblies()
-                .Select(a => a.GetType(scriptName))
-                .FirstOrDefault(t => t != null && typeof(MonoBehaviour).IsAssignableFrom(t));
+            // Resolve type via cache first
+            s_ScriptTypeCache.TryGetValue(scriptName, out var type);
+            if (type == null)
+            {
+                // Fallback: try simple name match in cache (case-insensitive)
+                var kv = s_ScriptTypeCache.FirstOrDefault(p => string.Equals(p.Key, scriptName, StringComparison.OrdinalIgnoreCase));
+                type = kv.Value;
+            }
 
             if (type == null)
             {
-                // Try with namespace-qualified guess if exists in default assembly
+                // Fallback: scan assemblies once more for rare cases
                 type = AppDomain.CurrentDomain.GetAssemblies()
-                    .SelectMany(a => a.GetTypes())
-                    .FirstOrDefault(t => t.Name == scriptName && typeof(MonoBehaviour).IsAssignableFrom(t));
+                    .SelectMany(a =>
+                    {
+                        try { return a.GetTypes(); } catch { return Array.Empty<Type>(); }
+                    })
+                    .FirstOrDefault(t => t != null && typeof(MonoBehaviour).IsAssignableFrom(t) && (t.Name == scriptName || t.FullName == scriptName));
+                if (type != null)
+                {
+                    if (!string.IsNullOrEmpty(type.FullName)) s_ScriptTypeCache[type.FullName] = type;
+                    if (!string.IsNullOrEmpty(type.Name)) s_ScriptTypeCache[type.Name] = type;
+                }
             }
 
             if (type == null)
@@ -522,38 +668,51 @@ public static class SpecBootstrapper
         }
 
             var mb = go.AddComponent(type);
-            if (mb == null || parameters == null || parameters.Count == 0) return;
+            if (mb == null) return;
 
             // Map parameters to public fields/properties by name
-            foreach (var kv in parameters)
+            if (parameters != null && parameters.Count > 0)
             {
-                string fieldName = kv.Key;
-                object value = kv.Value;
-
-                var field = type.GetField(fieldName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                var prop = type.GetProperty(fieldName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-
-                try
+                foreach (var kv in parameters)
                 {
-                    if (field != null)
+                    string fieldName = kv.Key;
+                    object value = kv.Value;
+
+                    var field = type.GetField(fieldName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    var prop = type.GetProperty(fieldName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+                    try
                     {
-                        object converted = ConvertParameterValue(value, field.FieldType);
-                        field.SetValue(mb, converted);
+                        if (field != null)
+                        {
+                            object converted = ConvertParameterValue(value, field.FieldType, go, fieldName, parameters);
+                            field.SetValue(mb, converted);
+                        }
+                        else if (prop != null && prop.CanWrite)
+                        {
+                            object converted = ConvertParameterValue(value, prop.PropertyType, go, fieldName, parameters);
+                            prop.SetValue(mb, converted);
+                        }
                     }
-                    else if (prop != null && prop.CanWrite)
+                    catch (Exception ex)
                     {
-                        object converted = ConvertParameterValue(value, prop.PropertyType);
-                        prop.SetValue(mb, converted);
+                        Debug.LogWarning($"SpecBootstrapper: Failed to set parameter '{fieldName}' on '{scriptName}': {ex.Message}");
                     }
                 }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning($"SpecBootstrapper: Failed to set parameter '{fieldName}' on '{scriptName}': {ex.Message}");
-                }
+            }
+
+            // Post-wiring: auto-assign common references if still null or default
+            try
+            {
+                AutoWireCommonFields(go, mb, type, parameters);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"SpecBootstrapper: Auto-wiring on '{scriptName}' failed: {ex.Message}");
             }
         }
 
-        private static object ConvertParameterValue(object value, Type targetType)
+        private static object ConvertParameterValue(object value, Type targetType, GameObject owner, string memberName, Dictionary<string, object> allParams)
         {
             if (value == null) return null;
             if (targetType == typeof(string)) return value.ToString();
@@ -564,6 +723,11 @@ public static class SpecBootstrapper
             {
                 var d = value as Dictionary<string, object>;
                 if (d != null) return new Vector2(GetFloat(d, "x", 0f), GetFloat(d, "y", 0f));
+            }
+            if (targetType == typeof(Vector3))
+            {
+                var d = value as Dictionary<string, object>;
+                if (d != null) return new Vector3(GetFloat(d, "x", 0f), GetFloat(d, "y", 0f), GetFloat(d, "z", 0f));
             }
             if (targetType == typeof(LayerMask))
             {
@@ -576,7 +740,156 @@ public static class SpecBootstrapper
                     return LayerMask.GetMask(names);
                 }
             }
+            // Component or GameObject/Transform resolution from hints
+            if (typeof(Component).IsAssignableFrom(targetType))
+            {
+                var go = ResolveGameObjectReference(value, owner);
+                if (go != null)
+                {
+                    var comp = go.GetComponent(targetType);
+                    if (comp != null) return comp;
+                }
+                // If asking for Transform, allow returning owner's Transform for common names
+                if (targetType == typeof(Transform))
+                {
+                    // Special-case ground check creation if requested by name
+                    if (!HasNonEmptyValue(value))
+                    {
+                        var created = MaybeCreateGroundCheck(owner, allParams);
+                        if (created != null) return created.transform;
+                    }
+                }
+                return null;
+            }
+            if (targetType == typeof(GameObject))
+            {
+                var go = ResolveGameObjectReference(value, owner);
+                if (go != null) return go;
+            }
             return value;
+        }
+
+        private static bool HasNonEmptyValue(object value)
+        {
+            if (value == null) return false;
+            if (value is string s) return !string.IsNullOrWhiteSpace(s);
+            if (value is Dictionary<string, object> d) return d.Count > 0;
+            return true;
+        }
+
+        private static GameObject ResolveGameObjectReference(object hint, GameObject context)
+        {
+            if (hint == null) return null;
+            // String hints: try child path, name, then tag
+            if (hint is string s)
+            {
+                if (context != null)
+                {
+                    var child = context.transform.Find(s);
+                    if (child != null) return child.gameObject;
+                    // case-insensitive child name search
+                    var foundChild = context.GetComponentsInChildren<Transform>(true).FirstOrDefault(t => string.Equals(t.name, s, StringComparison.OrdinalIgnoreCase));
+                    if (foundChild != null) return foundChild.gameObject;
+                }
+                var byName = GameObject.Find(s);
+                if (byName != null) return byName;
+                try { var byTag = GameObject.FindWithTag(s); if (byTag != null) return byTag; } catch { }
+            }
+            // Object hints
+            var dct = hint as Dictionary<string, object>;
+            if (dct != null)
+            {
+                string path = GetString(dct, "path");
+                string childName = GetString(dct, "child");
+                string name = GetString(dct, "name");
+                string tag = GetString(dct, "tag");
+                if (!string.IsNullOrEmpty(path) && context != null)
+                {
+                    var t = context.transform.Find(path);
+                    if (t != null) return t.gameObject;
+                }
+                if (!string.IsNullOrEmpty(childName) && context != null)
+                {
+                    var t = context.GetComponentsInChildren<Transform>(true).FirstOrDefault(x => string.Equals(x.name, childName, StringComparison.OrdinalIgnoreCase));
+                    if (t != null) return t.gameObject;
+                }
+                if (!string.IsNullOrEmpty(name))
+                {
+                    var go = GameObject.Find(name);
+                    if (go != null) return go;
+                }
+                if (!string.IsNullOrEmpty(tag))
+                {
+                    try { var byTag = GameObject.FindWithTag(tag); if (byTag != null) return byTag; } catch { }
+                }
+            }
+            return null;
+        }
+
+        private static void AutoWireCommonFields(GameObject owner, object component, Type type, Dictionary<string, object> parameters)
+        {
+            // Ground LayerMask default
+            var groundMaskField = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .FirstOrDefault(f => f.FieldType == typeof(LayerMask) && f.Name.IndexOf("ground", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (groundMaskField != null)
+            {
+                var val = (LayerMask)groundMaskField.GetValue(component);
+                if (val.value == 0)
+                {
+                    int groundLayer = LayerMask.NameToLayer("Ground");
+                    if (groundLayer >= 0)
+                    {
+                        groundMaskField.SetValue(component, LayerMask.GetMask("Ground"));
+                    }
+                }
+            }
+
+            // Ground check Transform default
+            var groundCheckField = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .FirstOrDefault(f => f.FieldType == typeof(Transform) && f.Name.IndexOf("groundcheck", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (groundCheckField != null)
+            {
+                var cur = groundCheckField.GetValue(component) as Transform;
+                if (cur == null)
+                {
+                    var created = MaybeCreateGroundCheck(owner, parameters);
+                    if (created != null) groundCheckField.SetValue(component, created.transform);
+                }
+            }
+
+            // Rigidbody2D self-assign
+            var rbField = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .FirstOrDefault(f => f.FieldType == typeof(Rigidbody2D));
+            if (rbField != null && rbField.GetValue(component) == null)
+            {
+                var rb = owner.GetComponent<Rigidbody2D>();
+                if (rb != null) rbField.SetValue(component, rb);
+            }
+        }
+
+        private static GameObject MaybeCreateGroundCheck(GameObject owner, Dictionary<string, object> parameters)
+        {
+            if (owner == null) return null;
+            // Try use provided offset
+            Vector2 offset = new Vector2(0f, -0.2f);
+            if (parameters != null)
+            {
+                var off = parameters.ContainsKey("groundCheckLocalOffset") ? parameters["groundCheckLocalOffset"] as Dictionary<string, object> : null;
+                if (off != null)
+                {
+                    offset = new Vector2(GetFloat(off, "x", offset.x), GetFloat(off, "y", offset.y));
+                }
+            }
+            var sr = owner.GetComponent<SpriteRenderer>();
+            if (sr != null && sr.sprite != null)
+            {
+                // Adjust based on sprite world extents
+                offset = new Vector2(offset.x, -Mathf.Max(0.1f, sr.bounds.extents.y * 0.9f));
+            }
+            var gc = new GameObject("GroundCheck");
+            gc.transform.SetParent(owner.transform, false);
+            gc.transform.localPosition = new Vector3(offset.x, offset.y, 0f);
+            return gc;
         }
 
         private static string EnsureSpriteAssetAvailable(string relPath, float? pixelsPerUnit)
@@ -606,26 +919,23 @@ public static class SpecBootstrapper
                 s_ProcessedSpriteAssets.Add(assetsRel);
             }
 
-            if (pixelsPerUnit.HasValue)
+            var texImporter = AssetImporter.GetAtPath(assetsRel) as TextureImporter;
+            if (texImporter != null)
             {
-                var importer = AssetImporter.GetAtPath(assetsRel) as TextureImporter;
-                if (importer != null)
+                bool needsReimport = false;
+                if (texImporter.textureType != TextureImporterType.Sprite)
                 {
-                    bool needsReimport = false;
-                    if (importer.textureType != TextureImporterType.Sprite)
-                    {
-                        importer.textureType = TextureImporterType.Sprite;
-                        needsReimport = true;
-                    }
-                    if (Mathf.Abs(importer.spritePixelsPerUnit - pixelsPerUnit.Value) > 0.001f)
-                    {
-                        importer.spritePixelsPerUnit = pixelsPerUnit.Value;
-                        needsReimport = true;
-                    }
-                    if (needsReimport)
-                    {
-                        importer.SaveAndReimport();
-                    }
+                    texImporter.textureType = TextureImporterType.Sprite;
+                    needsReimport = true;
+                }
+                if (pixelsPerUnit.HasValue && Mathf.Abs(texImporter.spritePixelsPerUnit - pixelsPerUnit.Value) > 0.001f)
+                {
+                    texImporter.spritePixelsPerUnit = pixelsPerUnit.Value;
+                    needsReimport = true;
+                }
+                if (needsReimport)
+                {
+                    texImporter.SaveAndReimport();
                 }
             }
 
@@ -814,6 +1124,7 @@ public static class SpecBootstrapper
 
                 // consume '{'
                 json.Read();
+                int memberCount = 0;
 
                 while (true)
                 {
@@ -837,6 +1148,8 @@ public static class SpecBootstrapper
 
                     // value
                     table[name] = ParseValue();
+                    memberCount++;
+                    if (memberCount > 20000) return null;
 
                     switch (NextToken)
                     {
@@ -858,6 +1171,7 @@ public static class SpecBootstrapper
 
                 // skip '['
                 json.Read();
+                int itemCount = 0;
 
                 var parsing = true;
                 while (parsing)
@@ -877,6 +1191,8 @@ public static class SpecBootstrapper
                         default:
                             var value = ParseValue();
                             array.Add(value);
+                            itemCount++;
+                            if (itemCount > 20000) return null;
                             break;
                     }
                 }
