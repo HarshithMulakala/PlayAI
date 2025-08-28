@@ -1,58 +1,117 @@
 {
   "game": {
-    "title": "Forest Platformer"
-  },
-  "scenes": [
-    {
-      "name": "Level1",
-      "background": "forest_bg.png",
-      "tilemap": "grass_tileset.png",
-      "player": {
-        "sprite": "hero_idle.png",
-        "controller": "PlayerController.cs",
-        "spawn": [0, 0]
-      },
-      "enemies": [
-        {
-          "sprite": "slime.png",
-          "controller": "SlimeAI.cs",
-          "spawn": [5, 0]
-        },
-        {
-          "sprite": "bat.png",
-          "controller": "BatAI.cs",
-          "spawn": [8, 3]
-        }
-      ],
-      "collectibles": [
-        {
-          "sprite": "coin.png",
-          "spawn": [2, 1]
-        },
-        {
-          "sprite": "coin.png",
-          "spawn": [7, 2]
-        },
-        {
-          "sprite": "heart.png",
-          "spawn": [10, 4]
-        }
-      ],
-      "ui": [
-        {
-          "type": "label",
-          "text": "Score: 0",
-          "anchor": "top_left"
-        },
-        {
-          "type": "button",
-          "text": "Restart",
-          "anchor": "bottom_right",
-          "onClick": "RestartGame"
-        }
-      ]
-    }
-  ]
+    "metadata": {
+      "title": "My 2D Game",
+      "version": "0.1",
+      "author": "Your Name"
+    },
+    "scenes": [
+      {
+        "name": "MainScene",
+        "backgroundColor": "#87CEEB",
+        "gameObjects": [
+          {
+            "id": "player",
+            "name": "Player",
+            "type": "sprite",
+            "sprite": {
+              "path": "Assets/Sprites/player.png",
+              "sortingLayer": "Characters",
+              "orderInLayer": 0
+            },
+            "transform": {
+              "position": { "x": 0, "y": 0 },
+              "rotation": 0,
+              "scale": { "x": 1, "y": 1 }
+            },
+            "physics": {
+              "rigidbody2D": {
+                "bodyType": "Dynamic",
+                "gravityScale": 1,
+                "constraints": ["FreezeRotationZ"]
+              },
+              "collider2D": {
+                "type": "Box",
+                "size": { "x": 1, "y": 1 },
+                "isTrigger": false,
+                "material": null
+              }
+            },
+            "scripts": [
+              {
+                "name": "PlayerController",
+                "parameters": {
+                  "moveSpeed": 5,
+                  "jumpForce": 10
+                }
+              }
+            ]
+          },
+          {
+            "id": "ground",
+            "name": "Ground",
+            "type": "sprite",
+            "sprite": {
+              "path": "Assets/Sprites/ground.png",
+              "sortingLayer": "Environment",
+              "orderInLayer": 0
+            },
+            "transform": {
+              "position": { "x": 0, "y": -3 },
+              "rotation": 0,
+              "scale": { "x": 10, "y": 1 }
+            },
+            "physics": {
+              "rigidbody2D": {
+                "bodyType": "Static"
+              },
+              "collider2D": {
+                "type": "Box",
+                "size": { "x": 10, "y": 1 },
+                "isTrigger": false
+              }
+            },
+            "scripts": []
+          }
+        ],
+        "ui": [
+          {
+            "id": "scoreText",
+            "name": "ScoreText",
+            "type": "text",
+            "text": "Score: 0",
+            "font": "Arial",
+            "fontSize": 24,
+            "color": "#FFFFFF",
+            "alignment": "TopLeft",
+            "rectTransform": {
+              "anchorMin": { "x": 0, "y": 1 },
+              "anchorMax": { "x": 0, "y": 1 },
+              "pivot": { "x": 0, "y": 1 },
+              "position": { "x": 10, "y": -10 }
+            }
+          },
+          {
+            "id": "startButton",
+            "name": "StartButton",
+            "type": "button",
+            "text": "Start",
+            "sprite": "Assets/UI/button.png",
+            "rectTransform": {
+              "anchorMin": { "x": 0.5, "y": 0.5 },
+              "anchorMax": { "x": 0.5, "y": 0.5 },
+              "pivot": { "x": 0.5, "y": 0.5 },
+              "position": { "x": 0, "y": 0 }
+            },
+            "scripts": [
+              {
+                "name": "StartGameButton",
+                "parameters": {}
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
 }
-
-

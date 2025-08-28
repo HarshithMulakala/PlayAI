@@ -1,654 +1,508 @@
-import os
 import json
-import shutil
+import os
+import re
+import sys
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Optional
+import shutil
 
+import google.generativeai as genai
 import typer
-from rich import print
+from jsonschema import Draft202012Validator, validate
+from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt
+from PIL import Image
 
-# Load .env file if it exists
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    # dotenv not installed, try to load manually
-    env_path = Path(".env")
-    if env_path.exists():
-        with env_path.open("r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, value = line.split("=", 1)
-                    os.environ[key.strip()] = value.strip()
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-# --------------------------- Script Templates ------------------------------ #
-_PLAYER_CONTROLLER_CS = r"""
-using UnityEngine;
-
-public class PlayerController : MonoBehaviour
-{
-    public float moveSpeed = 5f;
-    public float jumpForce = 7f;
-    private Rigidbody2D _rb;
-    private BoxCollider2D _collider;
-    private bool _isGrounded;
-
-    private void Awake()
-    {
-        _rb = gameObject.GetComponent<Rigidbody2D>();
-        if (_rb == null) _rb = gameObject.AddComponent<Rigidbody2D>();
-        _rb.gravityScale = 3f;
-        _rb.constraints = RigidbodyConstraints2D.FreezeRotation;
-
-        _collider = gameObject.GetComponent<BoxCollider2D>();
-        if (_collider == null) _collider = gameObject.AddComponent<BoxCollider2D>();
-    }
-
-    private void Update()
-    {
-        float x = Input.GetAxisRaw("Horizontal");
-        Vector2 v = _rb.velocity;
-        v.x = x * moveSpeed;
-        _rb.velocity = v;
-
-        if (Input.GetButtonDown("Jump") && _isGrounded)
-        {
-            _rb.AddForce(Vector2.up * jumpForce, ForceMode2D.Impulse);
-        }
-    }
-
-    private void OnCollisionEnter2D(Collision2D other)
-    {
-        foreach (var contact in other.contacts)
-        {
-            if (Vector2.Dot(contact.normal, Vector2.up) > 0.5f)
-            {
-                _isGrounded = true;
-                break;
-            }
-        }
-    }
-
-    private void OnCollisionExit2D(Collision2D other)
-    {
-        _isGrounded = false;
-    }
-}
-""";
-
-_ENEMY_AI_CS = r"""
-using UnityEngine;
-
-public class EnemyAI : MonoBehaviour
-{
-    public float patrolAmplitude = 2f;
-    public float patrolSpeed = 1f;
-    private Vector3 _origin;
-
-    private void Start()
-    {
-        _origin = transform.position;
-        var rb = gameObject.GetComponent<Rigidbody2D>();
-        if (rb == null) rb = gameObject.AddComponent<Rigidbody2D>();
-        rb.gravityScale = 0.5f;
-        rb.constraints = RigidbodyConstraints2D.FreezeRotation;
-
-        var col = gameObject.GetComponent<Collider2D>();
-        if (col == null) col = gameObject.AddComponent<BoxCollider2D>();
-    }
-
-    private void Update()
-    {
-        float dx = Mathf.Sin(Time.time * patrolSpeed) * patrolAmplitude;
-        transform.position = new Vector3(_origin.x + dx, transform.position.y, transform.position.z);
-    }
-}
-""";
-
-_SLIME_AI_CS = r"""
-using UnityEngine;
-
-public class SlimeAI : EnemyAI
-{
-    // Can override behavior in the future
-}
-""";
-
-_BAT_AI_CS = r"""
-using UnityEngine;
-
-public class BatAI : EnemyAI
-{
-    private void Update()
-    {
-        // Circle the spawn point
-        float radius = 1.5f;
-        float speed = 1.2f;
-        float x = Mathf.Cos(Time.time * speed) * radius;
-        float y = Mathf.Sin(Time.time * speed) * radius;
-        transform.localPosition = new Vector3(x, y, 0f);
-    }
-}
-""";
-
-_COLLECTIBLE_CS = r"""
-using UnityEngine;
-
-public class Collectible : MonoBehaviour
-{
-    public int value = 1;
-
-    private void Reset()
-    {
-        var col = GetComponent<Collider2D>();
-        if (col == null) col = gameObject.AddComponent<CircleCollider2D>();
-        col.isTrigger = true;
-    }
-
-    private void OnTriggerEnter2D(Collider2D other)
-    {
-        if (other.gameObject.GetComponent<PlayerController>() != null)
-        {
-            Destroy(gameObject);
-        }
-    }
-}
-""";
-
-_GAME_UI_SCRIPTS_CS = r"""
-using UnityEngine;
-using UnityEngine.SceneManagement;
-
-public static class GameUIActions
-{
-    public static void RestartGame()
-    {
-        var scene = SceneManager.GetActiveScene();
-        SceneManager.LoadScene(scene.name);
-    }
-}
-""";
+app = typer.Typer(help="Generate a Unity 2D MVP game spec JSON using Gemini and save to output directory.")
+console = Console()
 
 
-app = typer.Typer(help="GameGen CLI: Generate a Unity 2D project scaffold from a text prompt.")
+DEFAULT_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_SCHEMA_PATH = Path("schema/GameSpec2D.schema.json")
+DEFAULT_ASSET_DIR = Path("asset_library")
+DEFAULT_UNITY_TEMPLATE_DIR = Path("unity_template")
 
 
-class GeminiClient:
-    """Thin wrapper for Gemini 2.5-Flash calls with graceful local fallbacks."""
+def load_schema(schema_path: Path) -> dict:
+    """Load and return the JSON schema as a Python dict."""
+    try:
+        with schema_path.open("r", encoding="utf-8") as f:
+            schema = json.load(f)
+    except FileNotFoundError:
+        raise typer.Exit(code=2)
 
-    def __init__(self, model_name: str = "gemini-2.5-flash") -> None:
-        self.model_name = model_name
-        self.api_key = os.environ.get("GEMINI_API_KEY")
-        self._client = None
+    # Validate the schema itself
+    Draft202012Validator.check_schema(schema)
+    return schema
 
-        if self.api_key:
-            print(f"[green]Gemini API key found: {self.api_key[:8]}...[/green]")
+
+def ensure_api_key() -> str:
+    """Read GEMINI_API_KEY from environment or exit with error."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        console.print(
+            Panel.fit(
+                "Environment variable GEMINI_API_KEY is not set.",
+                title="Missing API key",
+                subtitle="Set GEMINI_API_KEY and try again",
+                style="red",
+            )
+        )
+        raise typer.Exit(code=2)
+    return api_key
+
+
+def sanitize_filename(name: str) -> str:
+    """Create a filesystem-safe filename segment from arbitrary text."""
+    name = name.strip().lower()
+    name = re.sub(r"[^a-z0-9\-_]+", "-", name)
+    name = re.sub(r"-+", "-", name).strip("-")
+    return name or "gamespec"
+
+
+def extract_json(text: str) -> str:
+    """Robustly extract a JSON object or array string from model output."""
+    stripped = text.strip()
+
+    # Fast paths
+    if (stripped.startswith("{") and stripped.endswith("}")) or (
+        stripped.startswith("[") and stripped.endswith("]")
+    ):
+        return stripped
+
+    # Strip fenced code blocks (support both object and array)
+    fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+    if fenced_match:
+        candidate = fenced_match.group(1).strip()
+        if (candidate.startswith("{") and candidate.endswith("}")) or (
+            candidate.startswith("[") and candidate.endswith("]")
+        ):
+            return candidate
+
+    # Try to find outermost JSON array
+    first_b = stripped.find("[")
+    last_b = stripped.rfind("]")
+    if first_b != -1 and last_b != -1 and last_b > first_b:
+        return stripped[first_b : last_b + 1]
+
+    # Fallback: best-effort to find outermost object
+    first = stripped.find("{")
+    last = stripped.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        return stripped[first : last + 1]
+
+    return stripped
+
+
+def call_gemini(model_name: str, user_prompt: str, schema: dict, assets_catalog: list[dict]) -> dict:
+    """Call Gemini and return the parsed JSON object."""
+    api_key = ensure_api_key()
+    genai.configure(api_key=api_key)
+
+    system_instruction = (
+        "You are an expert Unity 2D technical game designer. "
+        "Generate a single JSON object that fully specifies a complete, minimal, shippable Unity 2D MVP game. "
+        "The JSON MUST strictly conform to the provided JSON Schema. "
+        "Do not include any explanations, comments, or additional text—only output the JSON object."
+    )
+
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=system_instruction,
+        generation_config={
+            # Encourage raw JSON output
+            "response_mime_type": "application/json",
+        },
+    )
+
+    prompt = (
+        "Using the following JSON Schema, generate a valid game specification object that fully describes a Unity 2D game MVP matching the user's idea.\n\n"
+        f"User idea:\n{user_prompt}\n\n"
+        "You MUST ONLY reference sprite assets that exist in the provided asset library.\n"
+        "When setting any sprite path (including UI sprites), the value MUST be exactly one of the 'path' fields from the asset library list below.\n"
+        "Use the width/height metadata (in pixels) to choose appropriate transform scale and placement.\n\n"
+        "For every script entry in 'scripts', ADD a 'description' field with a highly specific explanation of what the script should accomplish, including any physics, input, collision, and interactions.\n\n"
+        "Also populate project-level engine settings (tags, layers, sortingLayers, defaultPixelsPerUnit) under game.settings.\n"
+        "Populate per-object 'tag' and 'layer' where relevant (Player, Enemy, Coin, Spike, Ground).\n"
+        "For circle colliders, include 'radius'.\n"
+        "For scenes, include 'camera' (orthographic, size, position) and 'uiSettings' (Canvas render mode and referenceResolution).\n"
+        "For scripts, use 'parameters' to expose public fields (movement speeds, jumpForce, damageAmount, scoreValue, patrol distances, layer masks).\n\n"
+        "Asset library (allowed assets):\n"
+        f"{json.dumps(assets_catalog, indent=2)}\n\n"
+        "JSON Schema (draft 2020-12):\n"
+        f"{json.dumps(schema, indent=2)}\n"
+        "Return only the JSON object."
+    )
+
+    response = model.generate_content(prompt)
+    text = getattr(response, "text", None) or ""
+    json_text = extract_json(text)
+
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        console.print(Panel.fit(str(text)[:2000], title="Model output (truncated)", style="yellow"))
+        console.print(f"Failed to parse JSON from model output: {exc}", style="red")
+        raise typer.Exit(code=1)
+
+    return data
+
+
+def validate_against_schema(instance: dict, schema: dict) -> None:
+    """Validate instance against schema or exit with error details."""
+    try:
+        validate(instance=instance, schema=schema)
+    except Exception as exc:
+        console.print("Schema validation failed:", style="red")
+        console.print(str(exc), style="red")
+        raise typer.Exit(code=1)
+
+
+def scan_asset_library(asset_dir: Path) -> list[dict]:
+    """Scan the asset library for images and return metadata used for prompting.
+
+    Each item contains: { path, filename, width, height, ext }
+    """
+    if not asset_dir.exists():
+        console.print(f"Asset library directory not found: {asset_dir}", style="red")
+        raise typer.Exit(code=2)
+
+    exts = {".png", ".jpg", ".jpeg", ".gif"}
+    items: list[dict] = []
+    for p in sorted(asset_dir.iterdir()):
+        if p.is_file() and p.suffix.lower() in exts:
             try:
-                # Prefer new client name if available; otherwise fall back to google-generativeai
-                # These imports are optional and only used if installed.
-                import google.generativeai as genai  # type: ignore
-
-                genai.configure(api_key=self.api_key)
-                self._client = genai.GenerativeModel(self.model_name)
-                print(f"[green]Gemini client initialized with model: {self.model_name}[/green]")
-            except Exception as exc:  # pragma: no cover - optional dependency
-                print(f"[yellow]Gemini SDK not available or failed to init ({exc}). Using local fallback.[/yellow]")
-                self._client = None
-        else:
-            print("[yellow]No GEMINI_API_KEY found in environment. Using local fallback.[/yellow]")
-
-    # ------------------------------ Public API ------------------------------ #
-    def generate_spec(self, user_prompt: str) -> Dict:
-        """Return a GameSpec2D JSON document from user's text prompt."""
-        if self._client is None:
-            return self._fallback_spec(user_prompt)
-
-
-        try:
-            # Use structured output to ensure valid JSON
-            full_prompt = f"""Create a Unity 2D game specification based on this request: {user_prompt}
-
-The specification should include:
-- A game title
-- At least one scene with a name, background image, and tilemap
-- A player character with sprite, controller script, and spawn coordinates
-- Some enemies with sprites, controller scripts, and spawn coordinates  
-- Some collectibles with sprites and spawn coordinates
-- UI elements like labels and buttons
-
-Make sure all arrays have at least one item and coordinates are arrays of 2 numbers."""
-            
-            # Define the response schema for structured output (simplified for google-generativeai)
-            response_schema = {
-                "type": "object",
-                "properties": {
-                    "game": {
-                        "type": "object",
-                        "properties": {
-                            "title": {"type": "string"}
-                        }
-                    },
-                    "scenes": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "background": {"type": "string"},
-                                "tilemap": {"type": "string"},
-                                "player": {
-                                    "type": "object",
-                                    "properties": {
-                                        "sprite": {"type": "string"},
-                                        "controller": {"type": "string"},
-                                        "spawn": {
-                                            "type": "array",
-                                            "items": {"type": "number"}
-                                        }
-                                    }
-                                },
-                                "enemies": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "sprite": {"type": "string"},
-                                            "controller": {"type": "string"},
-                                            "spawn": {
-                                                "type": "array",
-                                                "items": {"type": "number"}
-                                            }
-                                        }
-                                    }
-                                },
-                                "collectibles": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "sprite": {"type": "string"},
-                                            "spawn": {
-                                                "type": "array",
-                                                "items": {"type": "number"}
-                                            }
-                                        }
-                                    }
-                                },
-                                "ui": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "type": {"type": "string"},
-                                            "text": {"type": "string"},
-                                            "anchor": {"type": "string"},
-                                            "onClick": {"type": "string"}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            rsp = self._client.generate_content(
-                full_prompt,
-                generation_config={
-                    "response_mime_type": "application/json",
-                    "response_schema": response_schema
+                with Image.open(p) as img:
+                    width, height = img.size
+            except Exception:
+                continue
+            rel_path = Path(asset_dir.name) / p.name
+            items.append(
+                {
+                    "path": rel_path.as_posix(),
+                    "filename": p.name,
+                    "width": width,
+                    "height": height,
+                    "ext": p.suffix.lower(),
                 }
             )
-            
-            # With structured output, we can use the parsed response directly
-            if hasattr(rsp, 'parsed') and rsp.parsed:
-                print(f"[green]Got parsed spec from Gemini[/green]")
-                return rsp.parsed
-            else:
-                # Fallback to text parsing if parsed is not available
-                text = rsp.text.strip()
-                print(f"[blue]Gemini response length: {len(text)}[/blue]")
-                if len(text) < 100:
-                    print(f"[blue]Gemini response preview: {repr(text)}[/blue]")
-                
-                if not text:
-                    print("[yellow]Gemini returned empty response. Using fallback.[/yellow]")
-                    return self._fallback_spec(user_prompt)
-                
-                try:
-                    data = json.loads(text)
-                    print(f"[green]Parsed JSON spec from Gemini[/green]")
-                    return data
-                except json.JSONDecodeError as exc:
-                    print(f"[yellow]Failed to parse JSON from Gemini: {exc}[/yellow]")
-                    return self._fallback_spec(user_prompt)
-                
-        except Exception as exc:  # pragma: no cover
-            print(f"[yellow]Gemini spec generation failed: {exc}. Using fallback.[/yellow]")
-            return self._fallback_spec(user_prompt)
+    if not items:
+        console.print("No image assets found in asset_library. The model will have no sprites to reference.", style="yellow")
+    return items
 
-    def generate_scripts(self, spec: Dict) -> Dict[str, str]:
-        """Return a dict of {relative_path: file_content} for Unity C# scripts.
-        Dynamically determines which scripts are required from the spec and generates each file individually.
-        """
-        required_paths, onclick_names = self._determine_required_scripts(spec)
-        results: Dict[str, str] = {}
 
-        # If no LLM, defer to dynamic fallback
-        if self._client is None:
-            print("[yellow]Using dynamic fallback script generation (no Gemini client)[/yellow]")
-            return self._fallback_scripts(spec)
+def collect_referenced_asset_paths(spec: dict) -> set[str]:
+    """Collect all asset paths referenced in the spec for sprites and UI images."""
+    paths: set[str] = set()
+    game = spec.get("game", {})
+    for scene in game.get("scenes", []) or []:
+        # gameObjects sprites
+        for go in scene.get("gameObjects", []) or []:
+            sprite = go.get("sprite") or {}
+            path = sprite.get("path")
+            if isinstance(path, str):
+                paths.add(path)
+        # UI sprites
+        for ui in scene.get("ui", []) or []:
+            path = ui.get("sprite")
+            if isinstance(path, str):
+                paths.add(path)
+    return paths
 
-        # Generate each required script one-by-one via Gemini
-        for rel_path in sorted(required_paths):
-            file_name = Path(rel_path).name
-            try:
-                # UI actions file is generated locally (strongly-typed to spec)
-                if file_name == "GameUIScripts.cs":
-                    results[rel_path] = self._build_ui_actions_script(sorted(onclick_names))
+
+def validate_asset_usage(spec: dict, allowed_paths: set[str]) -> None:
+    """Ensure all referenced asset paths are from the allowed list."""
+    referenced = collect_referenced_asset_paths(spec)
+    invalid = sorted(p for p in referenced if p not in allowed_paths)
+    if invalid:
+        console.print("Invalid asset paths detected in generated spec:", style="red")
+        for p in invalid:
+            console.print(f" - {p}", style="red")
+        console.print("Allowed paths are:", style="yellow")
+        for p in sorted(allowed_paths):
+            console.print(f" - {p}", style="yellow")
+        raise typer.Exit(code=1)
+
+
+def collect_script_specs(spec: dict) -> list[dict]:
+    """Collect unique script definitions with usage context from spec."""
+    scripts: dict[str, dict] = {}
+    game = spec.get("game", {})
+    for scene in game.get("scenes", []) or []:
+        scene_name = scene.get("name") or "Scene"
+        # GameObject scripts
+        for go in scene.get("gameObjects", []) or []:
+            owner = {
+                "ownerType": "gameObject",
+                "ownerName": go.get("name") or go.get("id") or "GameObject",
+                "sceneName": scene_name,
+            }
+            for sc in (go.get("scripts") or []):
+                if not isinstance(sc, dict):
                     continue
+                name = str(sc.get("name") or "Script").strip()
+                key = name
+                if key not in scripts:
+                    scripts[key] = {
+                        "name": name,
+                        "parametersExamples": [],
+                        "usedBy": [],
+                        "descriptions": [],
+                    }
+                scripts[key]["usedBy"].append(owner)
+                if isinstance(sc.get("parameters"), dict) and sc["parameters"]:
+                    scripts[key]["parametersExamples"].append(sc["parameters"])
+                if isinstance(sc.get("description"), str) and sc["description"].strip():
+                    scripts[key]["descriptions"].append(sc["description"].strip())
+        # UI scripts
+        for ui in scene.get("ui", []) or []:
+            owner = {
+                "ownerType": "uiElement",
+                "ownerName": ui.get("name") or ui.get("id") or "UIElement",
+                "sceneName": scene_name,
+            }
+            for sc in (ui.get("scripts") or []):
+                if not isinstance(sc, dict):
+                    continue
+                name = str(sc.get("name") or "Script").strip()
+                key = name
+                if key not in scripts:
+                    scripts[key] = {
+                        "name": name,
+                        "parametersExamples": [],
+                        "usedBy": [],
+                        "descriptions": [],
+                    }
+                scripts[key]["usedBy"].append(owner)
+                if isinstance(sc.get("parameters"), dict) and sc["parameters"]:
+                    scripts[key]["parametersExamples"].append(sc["parameters"])
+                if isinstance(sc.get("description"), str) and sc["description"].strip():
+                    scripts[key]["descriptions"].append(sc["description"].strip())
 
-                prompt = (
-                    "You are a Unity C# generator. Create a complete, compilable C# script suitable for Unity 2D. "
-                    f"The file name is '{file_name}'. Consider this game spec JSON to tailor behavior: \n\n"
-                    f"{json.dumps(spec, indent=2)}\n\n"
-                    "Rules:\n"
-                    "- Return ONLY raw C# code (no markdown fences or commentary).\n"
-                    "- Use only Unity built-in APIs.\n"
-                    "- For controllers, include sensible defaults (Rigidbody2D, Collider2D if needed).\n"
-                )
-                rsp = self._client.generate_content(prompt)
-                code = (rsp.text or "").strip()
-                if not code:
-                    raise ValueError("Empty response from Gemini")
-                results[rel_path] = code
-            except Exception as exc:
-                print(f"[yellow]Gemini failed to generate {file_name}: {exc}. Using template/stub.[/yellow]")
-                tmpl = self._template_for_known(file_name)
-                if tmpl is None:
-                    results[rel_path] = self._default_stub_for(file_name)
-                else:
-                    results[rel_path] = tmpl
-
-        # If any specialized enemy that extends EnemyAI template was used, ensure EnemyAI base exists in results
-        if any(Path(p).name in ("SlimeAI.cs", "BatAI.cs") for p in results.keys()) and \
-           "Assets/Scripts/EnemyAI.cs" not in results:
-            results["Assets/Scripts/EnemyAI.cs"] = _ENEMY_AI_CS
-
-        return results
-
-    def _determine_required_scripts(self, spec: Dict) -> tuple[set, set]:
-        required_paths: set = set()
-        onclick_names: set = set()
-
-        for scene in spec.get("scenes", []) or []:
-            player = scene.get("player") or {}
-            controller = player.get("controller")
-            if isinstance(controller, str) and controller.endswith(".cs"):
-                required_paths.add(f"Assets/Scripts/{controller}")
-
-            for enemy in scene.get("enemies", []) or []:
-                e_ctrl = enemy.get("controller")
-                if isinstance(e_ctrl, str) and e_ctrl.endswith(".cs"):
-                    required_paths.add(f"Assets/Scripts/{e_ctrl}")
-
-            # Collectible behavior helper if any collectibles are present
-            if scene.get("collectibles"):
-                required_paths.add("Assets/Scripts/Collectible.cs")
-
-            # UI actions: gather any onClick names
-            for ui in scene.get("ui", []) or []:
-                name = ui.get("onClick")
-                if isinstance(name, str) and name.strip():
-                    onclick_names.add(name.strip())
-
-        # Only include GameUIScripts.cs if we actually have any actions
-        if onclick_names:
-            required_paths.add("Assets/Scripts/GameUIScripts.cs")
-
-        return required_paths, onclick_names
-
-    def _build_ui_actions_script(self, action_names: List[str]) -> str:
-        # Always include RestartGame if requested; otherwise generate stubs
-        methods: List[str] = []
-        for name in action_names:
-            if name == "RestartGame":
-                methods.append(
-                    """
-    public static void RestartGame()
-    {
-        var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
-        UnityEngine.SceneManagement.SceneManager.LoadScene(scene.name);
-    }
-                    """.strip()
-                )
-            else:
-                methods.append(
-                    f"""
-    public static void {name}()
-    {{
-        UnityEngine.Debug.Log("UI Action invoked: {name}");
-    }}
-                    """.strip()
-                )
-
-        body = "\n\n".join(methods)
-        return (
-            "using UnityEngine;\n"
-            "using UnityEngine.SceneManagement;\n\n"
-            "public static class GameUIActions\n{\n"
-            f"{body}\n"
-            "}\n"
-        )
-
-    def _default_stub_for(self, file_name: str) -> str:
-        class_name = file_name.replace(".cs", "").strip()
-        return (
-            "using UnityEngine;\n\n"
-            f"public class {class_name} : MonoBehaviour\n"
-            "{\n"
-            "    private void Awake() { }\n"
-            "    private void Update() { }\n"
-            "}\n"
-        )
-
-    def _template_for_known(self, file_name: str) -> Optional[str]:
-        if file_name == "PlayerController.cs":
-            return _PLAYER_CONTROLLER_CS
-        if file_name == "EnemyAI.cs":
-            return _ENEMY_AI_CS
-        if file_name == "SlimeAI.cs":
-            return _SLIME_AI_CS
-        if file_name == "BatAI.cs":
-            return _BAT_AI_CS
-        if file_name == "Collectible.cs":
-            return _COLLECTIBLE_CS
-        if file_name == "GameUIScripts.cs":
-            # Use dynamic build instead; kept here for safety
-            return _GAME_UI_SCRIPTS_CS
-        return None
-
-    # ------------------------------ Fallbacks ------------------------------- #
-    def _fallback_spec(self, user_prompt: str) -> Dict:
-        # Minimal example spec resembling the provided example
-        return {
-            "game": {"title": "Forest Platformer"},
-            "scenes": [
-                {
-                    "name": "Level1",
-                    "background": "forest_bg.png",
-                    "tilemap": "grass_tileset.png",
-                    "player": {
-                        "sprite": "hero_idle.png",
-                        "controller": "PlayerController.cs",
-                        "spawn": [0, 0],
-                    },
-                    "enemies": [
-                        {"sprite": "slime.png", "controller": "SlimeAI.cs", "spawn": [5, 0]},
-                        {"sprite": "bat.png", "controller": "BatAI.cs", "spawn": [8, 3]},
-                    ],
-                    "collectibles": [
-                        {"sprite": "coin.png", "spawn": [2, 1]},
-                        {"sprite": "coin.png", "spawn": [7, 2]},
-                        {"sprite": "heart.png", "spawn": [10, 4]},
-                    ],
-                    "ui": [
-                        {"type": "label", "text": "Score: 0", "anchor": "top_left"},
-                        {"type": "button", "text": "Restart", "anchor": "bottom_right", "onClick": "RestartGame"},
-                    ],
-                }
-            ],
-        }
-
-    def _fallback_scripts(self, spec: Dict) -> Dict[str, str]:
-        scripts: Dict[str, str] = {}
-        required_paths, onclick_names = self._determine_required_scripts(spec)
-
-        for rel_path in sorted(required_paths):
-            file_name = Path(rel_path).name
-            if file_name == "GameUIScripts.cs":
-                scripts[rel_path] = self._build_ui_actions_script(sorted(onclick_names))
-                continue
-
-            tmpl = self._template_for_known(file_name)
-            if tmpl is None:
-                scripts[rel_path] = self._default_stub_for(file_name)
-            else:
-                scripts[rel_path] = tmpl
-
-        # Ensure base EnemyAI if we provided Slime/Bat templates
-        if any(Path(p).name in ("SlimeAI.cs", "BatAI.cs") for p in scripts.keys()) and \
-           "Assets/Scripts/EnemyAI.cs" not in scripts:
-            scripts["Assets/Scripts/EnemyAI.cs"] = _ENEMY_AI_CS
-
-        print("[yellow]Using fallback scripts (generated per spec) since Gemini generation failed[/yellow]")
-        return scripts
+    return list(scripts.values())
 
 
-def copy_unity_template(template_dir: Path, out_dir: Path) -> None:
-    if out_dir.exists():
-        print(f"[yellow]Output directory exists: {out_dir}. Files may be overwritten.[/yellow]")
+def sanitize_csharp_filename(script_name: str) -> str:
+    """Make a safe .cs filename, preserving provided names when possible."""
+    # Keep base name only
+    base = Path(script_name).name if script_name else ""
+    base = base or "GeneratedScript.cs"
+    if not base.lower().endswith(".cs"):
+        base = f"{base}.cs"
+    # Replace disallowed characters but preserve original casing
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", base)
+    # Avoid leading dots or dashes
+    safe = safe.lstrip(".-") or "GeneratedScript.cs"
+    return safe
 
-    shutil.copytree(template_dir, out_dir, dirs_exist_ok=True)
 
+def prepare_unity_project(
+    unity_template_dir: Path,
+    unity_out_dir: Path,
+    assets_catalog: list[dict],
+    asset_source_dir: Path,
+    spec_file: Path,
+) -> None:
+    """Copy Unity template and required files into a new project folder.
 
-def purge_template_scripts(out_dir: Path) -> None:
-    """Remove default template scripts so only spec-required scripts remain.
-    Keeps helper scripts like UIInvokeStatic.cs.
+    - Copies the entire unity_template to unity_out_dir
+    - Copies all referenced assets from asset_source_dir into Assets/asset_library
+    - Copies the spec JSON to Assets/Specs/
     """
-    scripts_dir = out_dir / "Assets" / "Scripts"
-    if not scripts_dir.exists():
-        return
-    for path in scripts_dir.glob("*.cs"):
-        if path.name == "UIInvokeStatic.cs":
-            continue
-        try:
-            path.unlink()
-        except Exception:
-            pass
+    if not unity_template_dir.exists():
+        raise FileNotFoundError(f"Unity template not found: {unity_template_dir}")
+
+    # Copy template
+    if unity_out_dir.exists():
+        # Do not nuke existing; allow re-use. Copy missing/overwrite files.
+        pass
+    else:
+        shutil.copytree(unity_template_dir, unity_out_dir)
+
+    # Ensure asset and spec dirs
+    assets_dst_dir = unity_out_dir / "Assets" / asset_source_dir.name
+    specs_dst_dir = unity_out_dir / "Assets" / "Specs"
+    assets_dst_dir.mkdir(parents=True, exist_ok=True)
+    specs_dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy assets that are referenced
+    referenced = {a["filename"] for a in assets_catalog}
+    for item in assets_catalog:
+        src = asset_source_dir / item["filename"]
+        dst = assets_dst_dir / src.name
+        if src.exists():
+            shutil.copy2(src, dst)
+
+    # Copy spec
+    shutil.copy2(spec_file, specs_dst_dir / spec_file.name)
 
 
-def write_spec(out_dir: Path, spec: Dict) -> Path:
-    dst = out_dir / "Assets" / "Resources" / "Bootstrap"
-    dst.mkdir(parents=True, exist_ok=True)
-    spec_path = dst / "GameSpec2D.json"
-    with spec_path.open("w", encoding="utf-8") as f:
-        json.dump(spec, f, ensure_ascii=False, indent=2)
-    return spec_path
+def call_gemini_generate_scripts(model_name: str, spec: dict, script_specs: list[dict]) -> list[dict]:
+    """Ask Gemini to generate C# scripts. Returns list of {filename, content}."""
+    api_key = ensure_api_key()
+    genai.configure(api_key=api_key)
+
+    system_instruction = (
+        "You are a senior Unity C# gameplay programmer. "
+        "Generate C# MonoBehaviour scripts for the provided script specifications. "
+        "Follow Unity best practices, avoid external packages, and only use standard Unity APIs. "
+        "Return ONLY a JSON array of objects with fields 'filename' and 'content'. "
+        "Each file should be a complete compilable .cs file."
+    )
+
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=system_instruction,
+        generation_config={
+            "response_mime_type": "application/json",
+        },
+    )
+
+    prompt = (
+        "Create one reusable script per unique script name in the list below. "
+        "Use the script 'name' as the C# class name (converted to a valid identifier). "
+        "If parametersExamples are provided, expose them as public fields with reasonable defaults, and match names where sensible. "
+        "Use the provided descriptions (if any) as the authoritative behavioral spec for the script. "
+        "Assume standard Unity 2D physics where appropriate. "
+        "Implement input with the Unity Input System package (UnityEngine.InputSystem). Avoid legacy Input.* APIs. "
+        "If a LayerMask is needed (e.g., ground), define a public LayerMask field and name it to match parameters if provided. "
+        "Only output the JSON array, nothing else.\n\n"
+        "Script specifications (unique names with usage contexts):\n"
+        f"{json.dumps(script_specs, indent=2)}\n\n"
+        "For context, here is the full game spec:\n"
+        f"{json.dumps(spec, indent=2)}\n"
+    )
+
+    response = model.generate_content(prompt)
+    text = getattr(response, "text", None) or ""
+    json_text = extract_json(text)
+    try:
+        files = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        console.print(Panel.fit(str(text)[:2000], title="Scripts output (truncated)", style="yellow"))
+        console.print(f"Failed to parse JSON for scripts: {exc}", style="red")
+        raise typer.Exit(code=1)
+
+    if not isinstance(files, list):
+        console.print("Expected a JSON array of files for scripts.", style="red")
+        raise typer.Exit(code=1)
+    return files
 
 
-def write_scripts(out_dir: Path, scripts: Dict[str, str]) -> List[Path]:
-    written: List[Path] = []
-    for rel_path, content in scripts.items():
-        dst = out_dir / rel_path
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        with dst.open("w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-        written.append(dst)
-    return written
-
-
-def copy_assets(library_dir: Path, out_dir: Path) -> List[Path]:
-    dst_root = out_dir / "Assets" / "3P"
-    dst_root.mkdir(parents=True, exist_ok=True)
-    written: List[Path] = []
-    if not library_dir.exists():
-        print(f"[yellow]Asset library not found: {library_dir}. Skipping copy.[/yellow]")
-        return written
-
-    for item in library_dir.iterdir():
-        if item.is_file() and (item.suffix.lower() == ".png" or item.suffix.lower() == ".meta"):
-            dst = dst_root / item.name
-            shutil.copy2(item, dst)
-            written.append(dst)
-    return written
-
-
-@app.command("new")
-def cmd_new(
-    prompt: str = typer.Option(..., "--prompt", "-p", help="Text prompt to describe the game"),
-    out: Path = typer.Option(Path("GeneratedGame"), "--out", help="Output directory for the Unity project"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip prompt for missing assets and proceed"),
+@app.command()
+def generate(
+    prompt: Optional[str] = typer.Option(None, "--prompt", "-p", help="Natural language description of the game to generate."),
+    prompt_file: Optional[Path] = typer.Option(None, "--prompt-file", "-f", help="Path to a file containing the prompt."),
+    outdir: Path = typer.Option(Path("output"), "--outdir", "-o", help="Directory where the JSON spec will be written."),
+    schema_path: Path = typer.Option(DEFAULT_SCHEMA_PATH, "--schema", help="Path to the JSON Schema file."),
+    model: str = typer.Option(DEFAULT_MODEL_NAME, "--model", help="Gemini model name. Defaults to env GEMINI_MODEL or gemini-2.5-flash."),
+    asset_dir: Path = typer.Option(DEFAULT_ASSET_DIR, "--assets", "-a", help="Directory containing the allowed sprite assets."),
+    scripts: bool = typer.Option(True, "--scripts/--no-scripts", help="Also generate C# scripts specified by the spec."),
+    prepare_unity: bool = typer.Option(True, "--prepare-unity/--no-prepare-unity", help="Copy Unity template and assets to a ready-to-open Unity project."),
+    unity_template: Path = typer.Option(DEFAULT_UNITY_TEMPLATE_DIR, "--unity-template", help="Path to the Unity template directory."),
+    unity_out: Path = typer.Option(Path("output/UnityProject"), "--unity-out", help="Destination directory for the prepared Unity project."),
 ):
-    """Generate a new Unity 2D project from a prompt using Gemini 2.5-Flash."""
+    """Generate a game spec JSON via Gemini and write it to the output directory."""
+    if not prompt and not prompt_file:
+        console.print("Provide --prompt or --prompt-file, or pipe text via STDIN.", style="yellow")
+        if not sys.stdin.isatty():
+            prompt = sys.stdin.read().strip()
+        else:
+            raise typer.Exit(code=2)
 
-    # Resolve repo paths
-    root = Path(__file__).parent
-    template_dir = root / "unity_template"
-    library_dir = root / "asset_library"
-
-
-
-    print(Panel.fit(f"[bold]GameGen[/bold] will create a Unity project at [cyan]{out}[/cyan]"))
-
-    # 1) Copy Unity template
-    copy_unity_template(template_dir, out)
-    print("[green]Template copied.[/green]")
-    purge_template_scripts(out)
-    print("[green]Cleaned default template scripts.[/green]")
-
-    # 2) Call Gemini to turn prompt into spec
-    gem = GeminiClient()
-    spec = gem.generate_spec(prompt)
-
-    # Optional: validate against schema if available
-    schema_path = root / "schema" / "GameSpec2D.schema.json"
-    if schema_path.exists():
+    if prompt_file and not prompt:
         try:
-            import jsonschema  # type: ignore
+            prompt = prompt_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            console.print(f"Prompt file not found: {prompt_file}", style="red")
+            raise typer.Exit(code=2)
 
-            with schema_path.open("r", encoding="utf-8") as f:
-                schema = json.load(f)
-            jsonschema.validate(instance=spec, schema=schema)
-        except Exception as exc:  # pragma: no cover - validation is best-effort
-            print(f"[yellow]Spec validation warning: {exc}[/yellow]")
+    assert prompt is not None
 
-    # 3) Write spec into project
-    spec_path = write_spec(out, spec)
-    print(f"[green]Wrote spec:[/green] {spec_path}")
+    schema = load_schema(schema_path)
+    assets_catalog = scan_asset_library(asset_dir)
+    allowed_paths = {a["path"] for a in assets_catalog}
 
-    # 4) Call Gemini with spec to produce scripts
-    scripts = gem.generate_scripts(spec)
-    script_paths = write_scripts(out, scripts)
-    print(f"[green]Wrote {len(script_paths)} scripts under Assets/Scripts/[/green]")
+    console.print(Panel.fit("Contacting Gemini to generate game spec...", title="Generating", style="cyan"))
+    data = call_gemini(model, prompt, schema, assets_catalog)
 
-    # 5) Copy .png assets (+ .meta) from asset_library → Assets/3P/
-    if not library_dir.exists() and not yes:
-        proceed = Prompt.ask(
-            "Asset library is missing. Proceed anyway? (sprites will be missing)", choices=["y", "n"], default="y"
-        )
-        if proceed.lower() != "y":
-            raise typer.Abort()
+    console.print("Validating against schema...", style="cyan")
+    validate_against_schema(data, schema)
 
-    copied = copy_assets(library_dir, out)
-    print(f"[green]Copied {len(copied)} asset files to Assets/3P/[/green]")
+    console.print("Validating asset usage...", style="cyan")
+    validate_asset_usage(data, allowed_paths)
 
-    print(Panel.fit("Project ready. Open it in Unity, then run: Menu → GameGen → Build From Spec"))
+    # Optional script generation
+    if scripts:
+        console.print("Collecting script specifications...", style="cyan")
+        script_specs = collect_script_specs(data)
+        if script_specs:
+            console.print(Panel.fit("Generating C# scripts...", title="Scripts", style="cyan"))
+            files = call_gemini_generate_scripts(model, data, script_specs)
+            scripts_dir = outdir / "scripts"
+            scripts_dir.mkdir(parents=True, exist_ok=True)
+            written = 0
+            for file in files:
+                if not isinstance(file, dict):
+                    continue
+                raw_name = str(file.get("filename") or "")
+                content = file.get("content")
+                if not content:
+                    continue
+                safe_name = sanitize_csharp_filename(raw_name or (file.get("name") or "Script"))
+                target = scripts_dir / safe_name
+                with target.open("w", encoding="utf-8") as f:
+                    f.write(content)
+                written += 1
+            console.print(Panel.fit(f"Wrote {written} script file(s) to: {scripts_dir}", title="Scripts", style="green"))
+        else:
+            console.print("No script specifications found in the game spec.", style="yellow")
+
+    # Determine filename
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    title = (
+        data.get("game", {})
+        .get("metadata", {})
+        .get("title", "Unity2DGame")
+    )
+    safe_title = sanitize_filename(str(title))
+    filename = f"{safe_title}-{timestamp}.json"
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    output_path = outdir / filename
+
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    console.print(Panel.fit(f"Wrote game spec to: {output_path}", title="Success", style="green"))
+
+    # Prepare Unity project directory with template, assets, and spec
+    if prepare_unity:
+        console.print(Panel.fit("Preparing Unity project...", title="Unity", style="cyan"))
+        try:
+            prepare_unity_project(
+                unity_template_dir=unity_template,
+                unity_out_dir=unity_out,
+                assets_catalog=assets_catalog,
+                asset_source_dir=asset_dir,
+                spec_file=output_path,
+            )
+            console.print(Panel.fit(f"Unity project ready at: {unity_out}", title="Unity", style="green"))
+            console.print(
+                "Open this folder in Unity, then run: Tools → AI → Import From Spec... (pick the copied spec and your output/scripts)",
+                style="cyan",
+            )
+        except Exception as exc:
+            console.print(f"Failed to prepare Unity project: {exc}", style="red")
 
 
 if __name__ == "__main__":
     app()
+
+

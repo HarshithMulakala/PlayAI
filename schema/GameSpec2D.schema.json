@@ -1,89 +1,196 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "GameSpec2D",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Unity2DGameSchema",
   "type": "object",
-  "required": ["game", "scenes"],
   "properties": {
     "game": {
       "type": "object",
-      "required": ["title"],
       "properties": {
-        "title": { "type": "string" }
-      },
-      "additionalProperties": false
-    },
-    "scenes": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["name"],
-        "properties": {
-          "name": { "type": "string" },
-          "background": { "type": "string" },
-          "tilemap": { "type": "string" },
-          "player": {
-            "$ref": "#/definitions/actor"
-          },
-          "enemies": {
-            "type": "array",
-            "items": { "$ref": "#/definitions/actor" }
-          },
-          "collectibles": {
-            "type": "array",
-            "items": { "$ref": "#/definitions/collectible" }
-          },
-          "ui": {
-            "type": "array",
-            "items": { "$ref": "#/definitions/uiElement" }
-          }
+        "settings": {
+          "$ref": "#/$defs/engineSettings"
         },
-        "additionalProperties": false
-      }
+        "metadata": {
+          "type": "object",
+          "properties": {
+            "title": { "type": "string" },
+            "version": { "type": "string" },
+            "author": { "type": "string" }
+          },
+          "required": ["title", "version"]
+        },
+        "scenes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "backgroundColor": { "type": "string", "pattern": "^#([A-Fa-f0-9]{6})$" },
+              "camera": { "$ref": "#/$defs/camera2D" },
+              "gameObjects": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/gameObject" }
+              },
+              "ui": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/uiElement" }
+              },
+              "uiSettings": { "$ref": "#/$defs/uiCanvasSettings" }
+            },
+            "required": ["name", "gameObjects"]
+          }
+        }
+      },
+      "required": ["metadata", "scenes"]
     }
   },
-  "definitions": {
-    "actor": {
+  "required": ["game"],
+  "$defs": {
+    "vector2": {
       "type": "object",
-      "required": ["sprite", "spawn"],
       "properties": {
-        "sprite": { "type": "string" },
-        "controller": { "type": "string" },
-        "spawn": {
-          "type": "array",
-          "minItems": 2,
-          "maxItems": 2,
-          "items": { "type": "number" }
-        }
+        "x": { "type": "number" },
+        "y": { "type": "number" }
       },
-      "additionalProperties": false
+      "required": ["x", "y"]
     },
-    "collectible": {
+    "transform": {
       "type": "object",
-      "required": ["sprite", "spawn"],
       "properties": {
-        "sprite": { "type": "string" },
-        "spawn": {
+        "position": { "$ref": "#/$defs/vector2" },
+        "rotation": { "type": "number" },
+        "scale": { "$ref": "#/$defs/vector2" }
+      },
+      "required": ["position", "rotation", "scale"]
+    },
+    "sprite": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "sortingLayer": { "type": "string" },
+        "orderInLayer": { "type": "integer" },
+        "pixelsPerUnit": { "type": "number" }
+      },
+      "required": ["path"]
+    },
+    "rigidbody2D": {
+      "type": "object",
+      "properties": {
+        "bodyType": { "type": "string", "enum": ["Static", "Dynamic", "Kinematic"] },
+        "gravityScale": { "type": "number" },
+        "constraints": {
           "type": "array",
-          "minItems": 2,
-          "maxItems": 2,
-          "items": { "type": "number" }
+          "items": { "type": "string" }
         }
       },
-      "additionalProperties": false
+      "required": ["bodyType"]
+    },
+    "collider2D": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["Box", "Circle", "Polygon"] },
+        "size": { "$ref": "#/$defs/vector2" },
+        "radius": { "type": "number" },
+        "isTrigger": { "type": "boolean" },
+        "material": { "type": ["string", "null"] }
+      },
+      "required": ["type"]
+    },
+    "physics": {
+      "type": "object",
+      "properties": {
+        "rigidbody2D": { "$ref": "#/$defs/rigidbody2D" },
+        "collider2D": { "$ref": "#/$defs/collider2D" }
+      }
+    },
+    "script": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "parameters": { "type": "object" }
+      },
+      "required": ["name"]
+    },
+    "gameObject": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "tag": { "type": "string" },
+        "layer": { "type": "string" },
+        "type": { "type": "string", "enum": ["sprite"] },
+        "sprite": { "$ref": "#/$defs/sprite" },
+        "transform": { "$ref": "#/$defs/transform" },
+        "physics": { "$ref": "#/$defs/physics" },
+        "scripts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/script" }
+        }
+      },
+      "required": ["id", "name", "type", "transform"]
+    },
+    "rectTransform": {
+      "type": "object",
+      "properties": {
+        "anchorMin": { "$ref": "#/$defs/vector2" },
+        "anchorMax": { "$ref": "#/$defs/vector2" },
+        "pivot": { "$ref": "#/$defs/vector2" },
+        "position": { "$ref": "#/$defs/vector2" }
+      },
+      "required": ["anchorMin", "anchorMax", "pivot", "position"]
     },
     "uiElement": {
       "type": "object",
-      "required": ["type"],
       "properties": {
-        "type": { "type": "string", "enum": ["label", "button", "score"] },
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "type": { "type": "string", "enum": ["text", "button", "image"] },
         "text": { "type": "string" },
-        "anchor": { "type": "string", "enum": ["top_left", "top_right", "bottom_left", "bottom_right", "center"] },
-        "onClick": { "type": "string" }
+        "font": { "type": "string" },
+        "fontSize": { "type": "integer" },
+        "color": { "type": "string", "pattern": "^#([A-Fa-f0-9]{6})$" },
+        "alignment": { "type": "string" },
+        "sprite": { "type": "string" },
+        "rectTransform": { "$ref": "#/$defs/rectTransform" },
+        "scripts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/script" }
+        }
       },
-      "additionalProperties": false
+      "required": ["id", "name", "type", "rectTransform"]
+    },
+    "camera2D": {
+      "type": "object",
+      "properties": {
+        "orthographic": { "type": "boolean" },
+        "size": { "type": "number" },
+        "position": { "$ref": "#/$defs/vector2" }
+      }
+    },
+    "uiCanvasSettings": {
+      "type": "object",
+      "properties": {
+        "renderMode": { "type": "string", "enum": ["ScreenSpaceOverlay", "ScreenSpaceCamera", "WorldSpace"] },
+        "referenceResolution": { "$ref": "#/$defs/vector2" }
+      }
+    },
+    "engineSettings": {
+      "type": "object",
+      "properties": {
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "layers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "sortingLayers": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "defaultPixelsPerUnit": { "type": "number" }
+      }
     }
-  },
-  "additionalProperties": false
+  }
 }
-
-
