@@ -370,7 +370,7 @@ def call_gemini_generate_scripts(model_name: str, spec: dict, script_specs: list
         "If parametersExamples are provided, expose them as public fields with reasonable defaults, and match names where sensible. "
         "Use the provided descriptions (if any) as the authoritative behavioral spec for the script. "
         "Assume standard Unity 2D physics where appropriate. "
-        "Implement input with the Unity Input System package (UnityEngine.InputSystem). Avoid legacy Input.* APIs. "
+        "Implement input using the legacy Input Manager APIs (UnityEngine.Input). Do NOT use UnityEngine.InputSystem. "
         "If a LayerMask is needed (e.g., ground), define a public LayerMask field and name it to match parameters if provided. "
         "Only output the JSON array, nothing else.\n\n"
         "Script specifications (unique names with usage contexts):\n"

@@ -126,8 +126,7 @@ public static class SpecBootstrapper
                 foreach (string s in sortingLayers) TryAddSortingLayer(s);
             }
 
-            // Ensure new Input System is enabled (Both to be safe)
-            TryEnableNewInputSystem();
+            // Input handling: leave as-is (template defaults to Both)
         }
 
         private static void BuildScenes(Dictionary<string, object> game)
@@ -417,48 +416,7 @@ public static class SpecBootstrapper
             }
         }
 
-        private static void TryEnableNewInputSystem()
-        {
-            // Try via reflection to support multiple Unity versions without compile-time API
-            try
-            {
-                var psType = typeof(PlayerSettings);
-                var enumType = psType.GetNestedType("ActiveInputHandling", BindingFlags.Public | BindingFlags.NonPublic);
-                var prop = psType.GetProperty("activeInputHandling", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
-                if (enumType != null && prop != null)
-                {
-                    var both = Enum.Parse(enumType, "Both");
-                    prop.SetValue(null, both);
-                    return;
-                }
-            }
-            catch { }
-
-            // Fallback: use legacy SetPropertyInt API (may show obsolete warning but works across versions)
-            try
-            {
-                PlayerSettings.SetPropertyInt("activeInputHandler", 2, EditorUserBuildSettings.selectedBuildTargetGroup);
-                return;
-            }
-            catch { }
-
-            // Final fallback: edit ProjectSettings asset directly
-            try
-            {
-                var assets = AssetDatabase.LoadAllAssetsAtPath("ProjectSettings/ProjectSettings.asset");
-                if (assets != null && assets.Length > 0)
-                {
-                    var so = new SerializedObject(assets[0]);
-                    var p = so.FindProperty("activeInputHandler");
-                    if (p != null)
-                    {
-                        p.intValue = 2; // Both
-                        so.ApplyModifiedPropertiesWithoutUndo();
-                    }
-                }
-            }
-            catch { }
-        }
+        
 
         private static void BuildUIElement(Dictionary<string, object> ui)
         {
