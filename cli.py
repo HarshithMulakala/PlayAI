@@ -27,6 +27,7 @@ DEFAULT_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 DEFAULT_SCHEMA_PATH = Path("schema/GameSpec2D.schema.json")
 DEFAULT_ASSET_DIR = Path("asset_library")
 DEFAULT_UNITY_TEMPLATE_DIR = Path("unity_template")
+DEFAULT_TILEMAP_REF_PATH = Path("schema/tilemapref.json")
 
 
 def load_schema(schema_path: Path) -> dict:
@@ -40,6 +41,20 @@ def load_schema(schema_path: Path) -> dict:
     # Validate the schema itself
     Draft202012Validator.check_schema(schema)
     return schema
+
+
+def load_tilemap_ref(tilemap_ref_path: Optional[Path]) -> Optional[dict]:
+    """Load tilemap reference JSON describing the atlas tiles (optional)."""
+    if not tilemap_ref_path:
+        return None
+    try:
+        with tilemap_ref_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or "tiles" not in data:
+            return None
+        return data
+    except Exception:
+        return None
 
 
 def ensure_api_key() -> str:
@@ -100,7 +115,25 @@ def extract_json(text: str) -> str:
     return stripped
 
 
-def call_gemini(model_name: str, user_prompt: str, schema: dict, assets_catalog: list[dict]) -> dict:
+def sanitize_json_like(text: str) -> str:
+    """Attempt to coerce near-JSON text into valid JSON by fixing common issues."""
+    # Normalize smart quotes to straight quotes
+    replacements = {
+        "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'",
+        "“": '"', "”": '"', "‘": "'", "’": "'",
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+    # Remove string concatenations like "..." + \n or \n + "..."
+    text = re.sub(r'"\s*\+\s*\n', '"', text)
+    text = re.sub(r"\+\s*\"", '"', text)
+    # Remove zero-width and non-printable control chars (except \n, \r, \t)
+    text = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", text)
+    text = ''.join(ch for ch in text if (ch >= ' ' or ch in ('\n', '\r', '\t')))
+    return text
+
+
+def call_gemini(model_name: str, user_prompt: str, schema: dict, assets_catalog: list[dict], tilemap_ref: Optional[dict]) -> dict:
     """Call Gemini and return the parsed JSON object."""
     api_key = ensure_api_key()
     genai.configure(api_key=api_key)
@@ -128,6 +161,10 @@ def call_gemini(model_name: str, user_prompt: str, schema: dict, assets_catalog:
         "When setting any sprite path (including UI sprites), the value MUST be exactly one of the 'path' fields from the asset library list below.\n"
         "Use the width/height metadata (in pixels) to choose appropriate transform scale and placement.\n"
         "For physics.colliders, include 'autoSize' (default true), and when needed 'size'/'radius' and 'offset' to fine-tune alignment.\n\n"
+        "Prefer building the level using tilemaps (for ground, walls, platforms) instead of large sprites. "
+        "Define a 'tilesets' array at the game level with an entry named 'DefaultTiles' that references 'asset_library/tilemap.png' as 'atlas', tileSize {x:32,y:32}, pixelsPerUnit 100, filterMode 'Point', compression 'None'. "
+        "Then add one or more 'tilemaps' per scene that reference 'DefaultTiles' and provide a 'grid' with string rows and a 'legend' mapping characters to tile names from the tileset (see schema). "
+        "Ensure the map composition looks good: vary edges/corners/centers, place details, and add composite collider where needed.\n\n"
         "For every script entry in 'scripts', ADD a 'description' field with a highly specific explanation of what the script should accomplish, including any physics, input, collision, and interactions.\n\n"
         "Also populate project-level engine settings (tags, layers, sortingLayers, defaultPixelsPerUnit) under game.settings.\n"
         "Populate per-object 'tag' and 'layer' where relevant (Player, Enemy, Coin, Spike, Ground).\n"
@@ -138,7 +175,8 @@ def call_gemini(model_name: str, user_prompt: str, schema: dict, assets_catalog:
         "For scripts, use 'parameters' to expose public fields (movement speeds, jumpForce, damageAmount, scoreValue, patrol distances, layer masks).\n\n"
         "Asset library (allowed assets):\n"
         f"{json.dumps(assets_catalog, indent=2)}\n\n"
-        "JSON Schema (draft 2020-12):\n"
+        + ("Tilemap reference (allowed tiles; only use these names):\n" + json.dumps(tilemap_ref, indent=2) + "\n\n" if tilemap_ref else "")
+        + "JSON Schema (draft 2020-12):\n"
         f"{json.dumps(schema, indent=2)}\n"
         "Return only the JSON object."
     )
@@ -355,7 +393,7 @@ def call_gemini_generate_scripts(model_name: str, spec: dict, script_specs: list
         "You are a senior Unity C# gameplay programmer. "
         "Generate C# MonoBehaviour scripts for the provided script specifications. "
         "Follow Unity best practices, avoid external packages, and only use standard Unity APIs. "
-        "Return ONLY a JSON array of objects with fields 'filename' and 'content'. "
+        "Return ONLY a JSON array of objects with fields 'filename' and 'content'. Do not include base64 or arrays of lines. "
         "Each file should be a complete compilable .cs file. "
         "Write defensive code: if serialized references are not assigned, gracefully auto-resolve them at runtime (e.g., find children by name, find components on the same GameObject, or create helper child objects). "
         "Do not hard-crash on missing references; prefer early null checks and safe fallbacks."
@@ -366,6 +404,7 @@ def call_gemini_generate_scripts(model_name: str, spec: dict, script_specs: list
         system_instruction=system_instruction,
         generation_config={
             "response_mime_type": "application/json",
+            "temperature": 0.2,
         },
     )
 
@@ -380,7 +419,7 @@ def call_gemini_generate_scripts(model_name: str, spec: dict, script_specs: list
         "If a Transform is needed for ground probing, define a [SerializeField] private Transform named 'groundCheck'; if null at runtime, attempt to find a child named 'GroundCheck' or create one slightly below the sprite. "
         "When referencing components (Rigidbody2D/Animator/SpriteRenderer/Collider2D), get them lazily via GetComponent if fields are null. "
         "Never assume references are pre-assigned. "
-        "Only output the JSON array, nothing else.\n\n"
+        "Output ONLY a JSON array of objects with 'filename' and 'content' (raw C# text). Do not include markdown, code fences, base64, or arrays of lines. Escape JSON properly.\n\n"
         "Script specifications (unique names with usage contexts):\n"
         f"{json.dumps(script_specs, indent=2)}\n\n"
         "For context, here is the full game spec (use it to tailor required fields and logic to the actual scene objects, sizes, and tags/layers):\n"
@@ -411,6 +450,7 @@ def generate(
     schema_path: Path = typer.Option(DEFAULT_SCHEMA_PATH, "--schema", help="Path to the JSON Schema file."),
     model: str = typer.Option(DEFAULT_MODEL_NAME, "--model", help="Gemini model name. Defaults to env GEMINI_MODEL or gemini-2.5-flash."),
     asset_dir: Path = typer.Option(DEFAULT_ASSET_DIR, "--assets", "-a", help="Directory containing the allowed sprite assets."),
+    tilemap_ref: Optional[Path] = typer.Option(DEFAULT_TILEMAP_REF_PATH, "--tilemap-ref", help="Path to a tilemap reference JSON (tile names and coords)."),
     scripts: bool = typer.Option(True, "--scripts/--no-scripts", help="Also generate C# scripts specified by the spec."),
     prepare_unity: bool = typer.Option(True, "--prepare-unity/--no-prepare-unity", help="Copy Unity template and assets to a ready-to-open Unity project."),
     unity_template: Path = typer.Option(DEFAULT_UNITY_TEMPLATE_DIR, "--unity-template", help="Path to the Unity template directory."),
@@ -438,7 +478,8 @@ def generate(
     allowed_paths = {a["path"] for a in assets_catalog}
 
     console.print(Panel.fit("Contacting Gemini to generate game spec...", title="Generating", style="cyan"))
-    data = call_gemini(model, prompt, schema, assets_catalog)
+    tm_ref = load_tilemap_ref(tilemap_ref)
+    data = call_gemini(model, prompt, schema, assets_catalog, tm_ref)
 
     console.print("Validating against schema...", style="cyan")
     validate_against_schema(data, schema)

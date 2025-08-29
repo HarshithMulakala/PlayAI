@@ -10,6 +10,7 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
+using UnityEngine.Tilemaps;
 
 // SpecBootstrapper builds a Unity scene from the generated JSON spec and script files.
 // Workflow:
@@ -41,6 +42,241 @@ public static class SpecBootstrapper
             PrepareScriptsAndQueueImport(specPath, scriptsFolder);
         }
 
+        private static void BuildTilemapLayer(Dictionary<string, object> layerDict, int index, Dictionary<string, object> game)
+        {
+            string name = GetString(layerDict, "name") ?? $"Tilemap_{index}";
+            string tilesetName = GetString(layerDict, "tileset");
+            if (string.IsNullOrEmpty(tilesetName)) { Debug.LogWarning("SpecBootstrapper: Tilemap missing tileset."); return; }
+
+            // Find tileset by name in game.tilesets
+            var tilesets = GetList<object>(game, "tilesets");
+            var tileset = tilesets?.Select(o => o as Dictionary<string, object>).FirstOrDefault(d => string.Equals(GetString(d, "name"), tilesetName, StringComparison.Ordinal));
+            if (tileset == null) { Debug.LogWarning($"SpecBootstrapper: Tileset '{tilesetName}' not found."); return; }
+
+            string atlasRel = GetString(tileset, "atlas");
+            // Force pixels-per-unit to 32 so each 32x32 tile maps to 1 Unity unit
+            float ppu = 32f;
+            var tileSize = GetDict(tileset, "tileSize");
+            int tileW = (int)GetFloat(tileSize, "x", 32f);
+            int tileH = (int)GetFloat(tileSize, "y", 32f);
+
+            // Ensure atlas imported as sprite-sheet sliced
+            var atlasAssetPath = EnsureSpriteAssetAvailable(atlasRel, ppu);
+            SliceAtlasIfNeeded(atlasAssetPath, tileW, tileH, ppu, GetString(tileset, "filterMode") ?? "Point", GetString(tileset, "compression") ?? "None");
+
+            // Build name->sprite map from atlas and tileset.tiles coords
+            var spritesByName = LoadTileSpritesFromAtlas(atlasAssetPath, tileset, tileW, tileH);
+            if (spritesByName == null || spritesByName.Count == 0) { Debug.LogWarning("SpecBootstrapper: No tiles loaded from atlas."); }
+
+            // Root Grid (reuse or create) with robust component ensure
+            var gridTuple = GetOrCreateGrid();
+            var gridGO = gridTuple.Item1;
+            var grid = gridTuple.Item2;
+
+            var tmGO = new GameObject(name);
+            tmGO.transform.SetParent(gridGO.transform, false);
+            var tilemap = tmGO.AddComponent<Tilemap>();
+            var renderer = tmGO.AddComponent<TilemapRenderer>();
+
+            string sortingLayer = GetString(layerDict, "sortingLayer");
+            if (!string.IsNullOrEmpty(sortingLayer)) { TryAddSortingLayer(sortingLayer); renderer.sortingLayerName = sortingLayer; }
+            renderer.sortingOrder = (int)GetFloat(layerDict, "orderInLayer", 0f);
+
+            var origin = GetDict(layerDict, "origin");
+            if (origin != null) tmGO.transform.position = new Vector3(GetFloat(origin, "x", 0f), GetFloat(origin, "y", 0f), 0f);
+
+            var cellSz = GetDict(layerDict, "cellSize");
+            if (cellSz != null)
+            {
+                try
+                {
+                    // Re-fetch to avoid stale handle across reloads
+                    var g = gridGO != null ? gridGO.GetComponent<Grid>() : null;
+                    if (g == null && gridGO != null) g = gridGO.AddComponent<Grid>();
+                    if (g == null)
+                    {
+                        var created = GetOrCreateGrid();
+                        gridGO = created.Item1;
+                        g = created.Item2;
+                    }
+                    if (g != null)
+                    {
+                        g.cellSize = new Vector3(GetFloat(cellSz, "x", 1f), GetFloat(cellSz, "y", 1f), 0f);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"SpecBootstrapper: Failed to set Grid.cellSize: {ex.Message}");
+                }
+            }
+            else
+            {
+                try
+                {
+                    var g = gridGO != null ? gridGO.GetComponent<Grid>() : null;
+                    if (g == null && gridGO != null) g = gridGO.AddComponent<Grid>();
+                    if (g != null)
+                    {
+                        float csx = tileW / Mathf.Max(1f, ppu);
+                        float csy = tileH / Mathf.Max(1f, ppu);
+                        g.cellSize = new Vector3(csx, csy, 0f);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"SpecBootstrapper: Failed to set default Grid.cellSize: {ex.Message}");
+                }
+            }
+
+            // Grid from string rows with legend
+            var gridObj = GetDict(layerDict, "grid");
+            var rows = GetList<string>(gridObj, "rows");
+            var legend = GetDict(gridObj, "legend"); // char -> tile name (string or null)
+            string emptyChar = GetString(gridObj, "emptyChar") ?? ".";
+            if (rows != null && rows.Count > 0)
+            {
+                int height = rows.Count;
+                for (int y = 0; y < height; y++)
+                {
+                    string row = rows[height - 1 - y];
+                    for (int x = 0; x < row.Length; x++)
+                    {
+                        string c = row.Substring(x, 1);
+                        if (c == emptyChar) continue;
+                        string tileName = null;
+                        if (legend != null && legend.TryGetValue(c, out var mapped))
+                        {
+                            if (mapped == null) continue; // explicit skip
+                            tileName = mapped.ToString();
+                        }
+                        else
+                        {
+                            tileName = c; // direct name
+                        }
+                        if (string.IsNullOrEmpty(tileName)) continue;
+                        if (!spritesByName.TryGetValue(tileName, out var sprite) || sprite == null)
+                        {
+                            Debug.LogWarning($"SpecBootstrapper: Tile '{tileName}' not found in tileset '{tilesetName}'.");
+                            continue;
+                        }
+                        var tile = ScriptableObject.CreateInstance<Tile>();
+                        tile.sprite = sprite;
+                        tilemap.SetTile(new Vector3Int(x, y, 0), tile);
+                    }
+                }
+                // Force refresh so tiles render immediately in editor
+                tilemap.RefreshAllTiles();
+            }
+
+            // Collider
+            var col = GetDict(layerDict, "collider");
+            string colType = GetString(col, "type") ?? "None";
+            bool isTrigger = GetBool(col, "isTrigger", false);
+            if (colType != "None")
+            {
+                var tileCol = tmGO.AddComponent<TilemapCollider2D>();
+                tileCol.isTrigger = isTrigger;
+                if (colType == "Composite")
+                {
+                    var rb = tmGO.AddComponent<Rigidbody2D>();
+                    rb.bodyType = RigidbodyType2D.Static;
+                    var comp = tmGO.AddComponent<CompositeCollider2D>();
+                    tileCol.usedByComposite = true;
+                    comp.geometryType = CompositeCollider2D.GeometryType.Polygons;
+                }
+            }
+        }
+
+        private static void SliceAtlasIfNeeded(string atlasAssetPath, int tileW, int tileH, float ppu, string filterMode, string compression)
+        {
+            var importer = AssetImporter.GetAtPath(atlasAssetPath) as TextureImporter;
+            if (importer == null) return;
+            bool changed = false;
+            if (importer.textureType != TextureImporterType.Sprite) { importer.textureType = TextureImporterType.Sprite; changed = true; }
+            if (importer.spriteImportMode != SpriteImportMode.Multiple) { importer.spriteImportMode = SpriteImportMode.Multiple; changed = true; }
+            if (Mathf.Abs(importer.spritePixelsPerUnit - ppu) > 0.001f) { importer.spritePixelsPerUnit = ppu; changed = true; }
+
+            // Filter/Compression
+            var desiredFilter = filterMode == "Point" ? FilterMode.Point : filterMode == "Trilinear" ? FilterMode.Trilinear : FilterMode.Bilinear;
+            if (importer.filterMode != desiredFilter) { importer.filterMode = desiredFilter; changed = true; }
+            var desiredCompression = compression == "None" ? TextureImporterCompression.Uncompressed :
+                compression == "Low" ? TextureImporterCompression.CompressedLQ :
+                compression == "High" ? TextureImporterCompression.CompressedHQ : TextureImporterCompression.Compressed;
+            if (importer.textureCompression != desiredCompression) { importer.textureCompression = desiredCompression; changed = true; }
+
+            // Define slicing rects
+            Texture2D tex = AssetDatabase.LoadAssetAtPath<Texture2D>(atlasAssetPath);
+            if (tex != null)
+            {
+                int cols = tex.width / tileW;
+                int rows = tex.height / tileH;
+                var metas = new List<SpriteMetaData>();
+                metas.Capacity = cols * rows;
+                for (int yTop = 0; yTop < rows; yTop++)
+                {
+                    int yBottom = rows - 1 - yTop; // Unity rect uses bottom-left origin; our names use top-left origin
+                    for (int x = 0; x < cols; x++)
+                    {
+                        var smd = new SpriteMetaData();
+                        smd.rect = new Rect(x * tileW, yBottom * tileH, tileW, tileH);
+                        smd.name = $"tile_{x}_{yTop}";
+                        smd.alignment = (int)SpriteAlignment.Center;
+                        metas.Add(smd);
+                    }
+                }
+                if (importer.spritesheet == null || importer.spritesheet.Length != metas.Count)
+                {
+                    importer.spritesheet = metas.ToArray();
+                    changed = true;
+                }
+                // Ensure point filtering on importer settings too
+                if (importer.filterMode != FilterMode.Point)
+                {
+                    importer.filterMode = FilterMode.Point;
+                    changed = true;
+                }
+            }
+            if (changed)
+            {
+                importer.SaveAndReimport();
+            }
+        }
+
+        private static Dictionary<string, Sprite> LoadTileSpritesFromAtlas(string atlasAssetPath, Dictionary<string, object> tileset, int tileW, int tileH)
+        {
+            var map = new Dictionary<string, Sprite>(StringComparer.Ordinal);
+            var tiles = GetList<object>(tileset, "tiles");
+            if (tiles == null) return map;
+            var all = AssetDatabase.LoadAllAssetsAtPath(atlasAssetPath);
+            var tex = AssetDatabase.LoadAssetAtPath<Texture2D>(atlasAssetPath);
+            foreach (var tObj in tiles)
+            {
+                var t = tObj as Dictionary<string, object>;
+                if (t == null) continue;
+                string name = GetString(t, "name");
+                int tx = (int)GetFloat(t, "x", 0f);
+                int ty = (int)GetFloat(t, "y", 0f);
+                // tile coordinates in reference are from top-left origin
+                string expected = $"tile_{tx / tileW}_{ty / tileH}";
+                var sprite = all.OfType<Sprite>().FirstOrDefault(s => string.Equals(s.name, expected, StringComparison.Ordinal));
+                if (sprite == null && tex != null)
+                {
+                    // Fallback: create a runtime sprite from the atlas if named slice not found
+                    int yBottom = tex.height - ty - tileH; // convert top-left to bottom-left origin
+                    if (yBottom >= 0 && yBottom + tileH <= tex.height)
+                    {
+                        try
+                        {
+                            var rect = new Rect(tx, yBottom, tileW, tileH);
+                            sprite = Sprite.Create(tex, rect, new Vector2(0.5f, 0.5f), 32f);
+                        }
+                        catch { }
+                    }
+                }
+                if (sprite != null && !string.IsNullOrEmpty(name)) map[name] = sprite;
+            }
+            return map;
+        }
         private static void PrepareScriptsAndQueueImport(string specPath, string scriptsFolder)
         {
             Directory.CreateDirectory(GeneratedScriptsFolder);
@@ -74,6 +310,10 @@ public static class SpecBootstrapper
                 s_ProcessedSpriteAssets.Clear();
                 BuildScriptTypeCache();
                 string json = File.ReadAllText(specPath);
+                if (!string.IsNullOrEmpty(json) && json[0] == '\uFEFF')
+                {
+                    json = json.Substring(1); // strip UTF-8 BOM if present
+                }
                 if (string.IsNullOrWhiteSpace(json))
                 {
                     Debug.LogError("SpecBootstrapper: Spec file is empty.");
@@ -90,11 +330,22 @@ public static class SpecBootstrapper
                     Debug.LogError("SpecBootstrapper: Spec does not look like a JSON object. Ensure you selected the correct spec file.");
                     return;
                 }
+                // Try MiniJSON first; if it fails, fallback to Newtonsoft for robustness.
                 var root = MiniJSON.Deserialize(json) as Dictionary<string, object>;
                 if (root == null)
                 {
-                    Debug.LogError("SpecBootstrapper: Failed to parse spec JSON root.");
-                    return;
+                    try
+                    {
+                        var jroot = Newtonsoft.Json.Linq.JObject.Parse(json);
+                        root = jroot.ToObject<Dictionary<string, object>>();
+                    }
+                    catch
+                    {
+                        Debug.LogError("SpecBootstrapper: Failed to parse spec JSON root.");
+                        var previewLen = Math.Min(800, json.Length);
+                        Debug.LogError($"Spec preview (first {previewLen} chars):\n" + json.Substring(0, previewLen));
+                        return;
+                    }
                 }
 
                 var game = GetDict(root, "game");
@@ -240,6 +491,19 @@ public static class SpecBootstrapper
 
                 // Post placement: align dynamic objects tagged Player/Enemy/Coin on top of nearest ground
                 TryAlignObjectsToGround();
+
+                // Tilemaps
+                var tilemapsArr = GetList<object>(sceneDict, "tilemaps");
+                if (tilemapsArr != null)
+                {
+                    int idx = 0;
+                    foreach (var tObj in tilemapsArr)
+                    {
+                        var tDict = tObj as Dictionary<string, object>;
+                        if (tDict == null) continue;
+                        BuildTilemapLayer(tDict, idx++, game);
+                    }
+                }
 
                 // UI elements
                 var ui = GetList<object>(sceneDict, "ui");
@@ -1082,6 +1346,28 @@ public static class SpecBootstrapper
                 else if (typeof(T) == typeof(object)) result.Add((T)item);
             }
             return result;
+        }
+
+        private static Tuple<GameObject, Grid> GetOrCreateGrid()
+        {
+            var gridGO = GameObject.Find("Grid");
+            if (gridGO == null)
+            {
+                gridGO = new GameObject("Grid");
+            }
+            var grid = gridGO.GetComponent<Grid>();
+            if (grid == null)
+            {
+                try { grid = gridGO.AddComponent<Grid>(); }
+                catch { /* ignore and create a fresh carrier */ }
+            }
+            if (grid == null)
+            {
+                var freshGO = new GameObject("Grid");
+                grid = freshGO.AddComponent<Grid>();
+                gridGO = freshGO;
+            }
+            return Tuple.Create(gridGO, grid);
         }
     }
 

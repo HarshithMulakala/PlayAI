@@ -9,6 +9,10 @@
         "settings": {
           "$ref": "#/$defs/engineSettings"
         },
+        "tilesets": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/tileset" }
+        },
         "metadata": {
           "type": "object",
           "properties": {
@@ -33,6 +37,10 @@
               "ui": {
                 "type": "array",
                 "items": { "$ref": "#/$defs/uiElement" }
+              },
+              "tilemaps": {
+                "type": "array",
+                "items": { "$ref": "#/$defs/tilemapLayer" }
               },
               "uiSettings": { "$ref": "#/$defs/uiCanvasSettings" }
             },
@@ -194,6 +202,64 @@
         },
         "defaultPixelsPerUnit": { "type": "number" }
       }
+    },
+    "tileset": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "atlas": { "type": "string" },
+        "tileSize": { "$ref": "#/$defs/vector2" },
+        "pixelsPerUnit": { "type": "number" },
+        "filterMode": { "type": "string", "enum": ["Point", "Bilinear", "Trilinear"] },
+        "compression": { "type": "string", "enum": ["None", "Low", "Normal", "High"] },
+        "tiles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "x": { "type": "integer" },
+              "y": { "type": "integer" }
+            },
+            "required": ["name", "x", "y"]
+          }
+        }
+      },
+      "required": ["name", "atlas", "tileSize", "pixelsPerUnit"]
+    },
+    "tilemapLayer": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "tileset": { "type": "string" },
+        "sortingLayer": { "type": "string" },
+        "orderInLayer": { "type": "integer" },
+        "origin": { "$ref": "#/$defs/vector2" },
+        "cellSize": { "$ref": "#/$defs/vector2" },
+        "collider": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string", "enum": ["None", "Tilemap", "Composite"] },
+            "isTrigger": { "type": "boolean" }
+          }
+        },
+        "grid": {
+          "type": "object",
+          "properties": {
+            "rows": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "legend": {
+              "type": "object",
+              "additionalProperties": { "type": ["string", "null"] }
+            },
+            "emptyChar": { "type": "string" }
+          },
+          "required": ["rows"]
+        }
+      },
+      "required": ["name", "tileset", "grid"]
     }
   }
 }
